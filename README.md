@@ -34,11 +34,14 @@ You can run it using the following example and pass configuration environment va
 
 ```
 $ docker run \
-  -e 'EXPORTER_USERNAME=your-username@acme.tld' \
-  -e 'EXPORTER_PASSWORD=your-password' \
+  -v tado-exporter-data:/data \
+  -e 'EXPORTER_TICKER=1800' \
   -p '9898:9898' \
-  ekofr/tado-exporter:latest
+  akyrey/tado-exporter:latest
 ```
+
+Keep the `/data` volume: it stores the tado° refresh token (see [Authentication](#authentication)). Mount a
+directory, not the token file itself: the token is replaced atomically by renaming a temporary file.
 
 ### From sources
 
@@ -53,40 +56,40 @@ Then, just build the binary:
 $ cargo build --release
 ```
 
+## Authentication
+
+tado° no longer accepts username/password login (removed on 2025-03-21). The exporter uses the
+OAuth2 **device code flow** instead:
+
+1. On first start (or when the stored token is no longer valid), the exporter logs a line like:
+   ```
+   WARN tado° authorization required: open https://login.tado.com/oauth2/device?user_code=7BQ5ZQ in a browser and confirm code 7BQ5ZQ (valid for 300s)
+   ```
+2. Open the URL, log in to tado° and approve the device.
+3. The exporter stores the refresh token in `EXPORTER_TOKEN_PATH` (file mode `0600`) and renews
+   it automatically. tado° rotates refresh tokens on every use and they expire after 30 days unused,
+   so keep this file on persistent storage.
+
+The first poll happens right at startup, so the link appears immediately. If it expires before you approve
+it, a new one is logged on the next tick.
+
 ## Usage
 
-In order to run the exporter, type the following command (arguments are optional):
-
 ```bash
-$ export EXPORTER_TICKER=10
-$ export EXPORTER_USERNAME="my-username@acme.tld"
-$ export EXPORTER_PASSWORD="your-password"
+$ export EXPORTER_TICKER=1800
 $ ./tado-exporter
 --- tado° exporter configuration ---
-Ticker seconds: 10
-Username: my-username@acme.tld
-Password: your-password
-Client secret: wZaRN7rpjn3FoNyF5IFuxg9uMzYJcvOoQ8QWiIqS3hfk6gLhVlG57j5YNoZL2Rtc
+Ticker seconds: 1800
+Token path: tado-token.json
 ------------------------------------
-[2025-07-01T10:28:03Z INFO  tado_exporter] starting tado° exporter on address: 0.0.0.0:9898
-[2025-07-01T10:28:03Z INFO  tado_exporter::tado::client] Started device authentication flow with URL https://login.tado.com/oauth2/device?user_code=PTZ9BQ
-[2025-07-01T10:28:03Z INFO  tado_exporter::tado::client] Device authentication flow still pending, will retry
-[2025-07-01T10:28:08Z INFO  tado_exporter::tado::client] Device authentication flow still pending, will retry
-...
 ```
 
-At this point you will need to visit the provided URL (in this case, `https://login.tado.com/oauth2/device?user_code=PTZ9BQ`) in your browser and login to authorise the exporter on your behalf.
+### API rate limits
 
-Once that is done, then exporting should begin:
-
-```
-[2025-07-01T10:30:44Z INFO  tado_exporter::tado::client] Device authentication flow completed
-[2025-07-01T10:30:44Z INFO  tado_exporter] waiting for the first tick in 10 seconds...
-[2025-07-01T10:30:54Z INFO  tado_exporter::tado::client] retrieving zone details for Study...
-[2025-07-01T10:30:54Z INFO  tado_exporter::tado::client] retrieving zone details for Entrance Hall...
-[2025-07-01T10:30:54Z INFO  tado_exporter::tado::client] retrieving zone details for Master Bedroom...
-[2025-07-01T10:30:54Z INFO  tado_exporter::tado::client] retrieving zone details for Living Room...
-```
+tado° limits REST API usage to **100 requests/day** (20,000/day with an Auto-Assist subscription).
+Every tick costs `2 + number of zones` requests (zones list, one state per zone, weather), so choose
+`EXPORTER_TICKER` accordingly: e.g. with 4 zones on the free tier, a tick every 1800 seconds uses 288
+requests/day, which is already too many — use at least 5400 seconds (90 minutes).
 
 Once the exporter is running, you also have to update your `prometheus.yml` configuration to let it scrape the exporter:
 
@@ -101,10 +104,9 @@ scrape_configs:
 
 | Environment variable name    | Description                                                                                |
 |:----------------------------:|--------------------------------------------------------------------------------------------|
-| EXPORTER_USERNAME      | Required. This represent your tado° account username/email                                       |
-| EXPORTER_PASSWORD      | Required. This represent your tado° account password                                             |
-| EXPORTER_CLIENT_SECRET | Optional. This represent your tado° account client secret, using default value seems to work     |
-| EXPORTER_TICKER        | Optional (default: 10). This represent the number of seconds the exporter will look for new data |
+| EXPORTER_TOKEN_PATH    | Optional (default: `tado-token.json`, `/data/tado-token.json` in Docker). Where the refresh token is stored |
+| EXPORTER_CLIENT_ID     | Optional (default: `1bb50063-6b0c-4d11-bd99-387f4a91cc46`, tado°'s public web app client). OAuth client id used for the device code flow |
+| EXPORTER_TICKER        | Optional (default: 10). This represent the number of seconds the exporter will look for new data. Mind the [rate limits](#api-rate-limits) |
 | RUST_LOG               | Optional (default: info). This describes the log level (see https://docs.rs/env_logger/)         |
 
 ## Available Prometheus metrics
