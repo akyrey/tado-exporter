@@ -8,6 +8,7 @@ use std::fmt::Display;
 use std::str::FromStr;
 
 use super::rules::open_window::OpenWindowConfig;
+use super::rules::season::SeasonConfig;
 
 const DEFAULT_STATE_PATH: &str = "tado-automation.json";
 
@@ -17,6 +18,7 @@ pub struct AutomationConfig {
     pub dry_run: bool,
     pub state_path: String,
     pub open_window: OpenWindowConfig,
+    pub season: SeasonConfig,
 }
 
 impl AutomationConfig {
@@ -30,17 +32,25 @@ impl AutomationConfig {
             state_path: lookup("AUTOMATION_STATE_PATH")
                 .unwrap_or_else(|| DEFAULT_STATE_PATH.to_string()),
             open_window: OpenWindowConfig::from_lookup(&lookup),
+            season: SeasonConfig::from_lookup(&lookup),
         }
     }
 
     pub fn any_rule_enabled(&self) -> bool {
-        self.open_window.enabled
+        self.open_window.enabled || self.season.enabled
     }
 
     pub fn print(&self) {
         println!("Automation dry-run: {}", self.dry_run);
         println!("Automation state path: {}", self.state_path);
         println!("Automation open-window: {}", self.open_window.enabled);
+        println!(
+            "Automation season: {} (on below {}°C, off above {}°C, {}h mean)",
+            self.season.enabled,
+            self.season.on_below,
+            self.season.off_above,
+            self.season.window_hours
+        );
     }
 }
 

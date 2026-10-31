@@ -9,6 +9,7 @@ use log::warn;
 use serde_derive::{Deserialize, Serialize};
 
 use super::rules::open_window::OpenWindowState;
+use super::rules::season::SeasonState;
 use super::{Action, Snapshot, Timestamp, ZoneControl};
 use crate::persist::write_private_atomic;
 
@@ -42,6 +43,7 @@ pub struct AutomationState {
     /// Overlays applied by this exporter, by zone id.
     pub owned_overlays: BTreeMap<i32, OwnedOverlay>,
     pub open_window: OpenWindowState,
+    pub season: SeasonState,
 }
 
 /// Decides who controls a zone from its current overlay and what this exporter owns.
