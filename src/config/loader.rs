@@ -3,7 +3,9 @@ use std::env;
 
 use crate::tado::auth::DEFAULT_CLIENT_ID;
 
-const DEFAULT_TICKER_SECONDS: u64 = 10;
+/// 2 requests per tick every 5 minutes is ~576 requests/day, within tado°'s free quota
+/// observed in 2026 (1,000/day). Accounts on the documented 100/day need a longer ticker.
+const DEFAULT_TICKER_SECONDS: u64 = 300;
 const DEFAULT_TOKEN_PATH: &str = "tado-token.json";
 /// Variables used by the removed password grant; tado° no longer accepts them.
 const REMOVED_VARIABLES: [&str; 3] = [
@@ -78,7 +80,7 @@ mod tests {
         let config = load();
 
         // then we should load default values
-        assert_eq!(config.ticker, 10);
+        assert_eq!(config.ticker, 300);
         assert_eq!(config.token_path, "tado-token.json");
         assert_eq!(config.client_id, DEFAULT_CLIENT_ID);
 
@@ -101,7 +103,7 @@ mod tests {
 
     #[test]
     fn test_parse_ticker() {
-        assert_eq!(parse_ticker(None), 10);
+        assert_eq!(parse_ticker(None), 300);
         assert_eq!(parse_ticker(Some("5400")), 5400);
     }
 

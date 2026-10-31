@@ -107,7 +107,7 @@ below your quota with some headroom for restarts:
 |:----------------------------:|--------------------------------------------------------------------------------------------|
 | EXPORTER_TOKEN_PATH    | Optional (default: `tado-token.json`, `/data/tado-token.json` in Docker). Where the refresh token is stored |
 | EXPORTER_CLIENT_ID     | Optional (default: `1bb50063-6b0c-4d11-bd99-387f4a91cc46`, tado°'s public web app client). OAuth client id used for the device code flow |
-| EXPORTER_TICKER        | Optional (default: 10). This represent the number of seconds the exporter will look for new data. Mind the [rate limits](#api-rate-limits) |
+| EXPORTER_TICKER        | Optional (default: 300). This represent the number of seconds the exporter will look for new data. Mind the [rate limits](#api-rate-limits): on a 100 requests/day quota use at least 2700 |
 | RUST_LOG               | Optional (default: info). This describes the log level (see https://docs.rs/env_logger/)         |
 
 ## Available Prometheus metrics
