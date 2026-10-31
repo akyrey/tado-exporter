@@ -1,6 +1,7 @@
 use log::warn;
 use std::env;
 
+use crate::automation::config::AutomationConfig;
 use crate::tado::auth::DEFAULT_CLIENT_ID;
 
 /// 2 requests per tick every 5 minutes is ~576 requests/day, within tado°'s free quota
@@ -18,6 +19,7 @@ pub struct Config {
     pub ticker: u64,
     pub token_path: String,
     pub client_id: String,
+    pub automation: AutomationConfig,
 }
 
 impl Config {
@@ -26,6 +28,7 @@ impl Config {
         println!("Ticker seconds: {}", self.ticker);
         println!("Token path: {}", self.token_path);
         println!("Client ID: {}", self.client_id);
+        self.automation.print();
         println!("------------------------------------");
     }
 }
@@ -58,6 +61,7 @@ pub fn load() -> Config {
         ticker: parse_ticker(env::var("EXPORTER_TICKER").ok().as_deref()),
         token_path: env::var("EXPORTER_TOKEN_PATH").unwrap_or_else(|_| DEFAULT_TOKEN_PATH.into()),
         client_id: env::var("EXPORTER_CLIENT_ID").unwrap_or_else(|_| DEFAULT_CLIENT_ID.into()),
+        automation: AutomationConfig::from_env(),
     };
 
     config.print();

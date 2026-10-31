@@ -1,7 +1,9 @@
 #[macro_use]
 extern crate prometheus;
 
+mod automation;
 mod config;
+mod persist;
 mod tado;
 
 use env_logger::{Builder as LoggerBuilder, Env};
@@ -11,6 +13,8 @@ use std::convert::Infallible;
 use std::time::Duration;
 use tokio::time::MissedTickBehavior;
 
+use automation::engine::Engine as AutomationEngine;
+use automation::executor as automation_executor;
 use config::loader as config_loader;
 use tado::auth::Authenticator;
 use tado::client::Client as TadoClient;
@@ -53,6 +57,7 @@ fn run_ticker(config: config_loader::Config) {
             Authenticator::new(http_client.clone(), TokenStore::new(config.token_path))
                 .with_client_id(config.client_id);
         let mut tado_client = TadoClient::new(http_client, authenticator);
+        let mut automation = AutomationEngine::new(config.automation);
 
         // Use a ticker instead of sleeping within the loop.
         // This prevents drift as the ticker keeps counting down during refresh, unlike sleep.
@@ -65,8 +70,23 @@ fn run_ticker(config: config_loader::Config) {
         loop {
             ticker.tick().await;
             if tado_client.prepare().await {
-                metrics::set_zones(tado_client.retrieve_zones().await);
-                metrics::set_weather(tado_client.retrieve_weather().await);
+                let zones = tado_client.retrieve_zones().await;
+                let weather = tado_client.retrieve_weather().await;
+                let phones = if automation.needs_phones() {
+                    tado_client.retrieve_mobile_devices().await
+                } else {
+                    None
+                };
+                metrics::set_zones(&zones);
+                metrics::set_weather(weather.as_ref());
+                automation_executor::run_tick(
+                    &mut automation,
+                    &mut tado_client,
+                    &zones,
+                    weather.as_ref(),
+                    phones.as_deref(),
+                )
+                .await;
             }
             metrics::set_rate_limit(tado_client.rate_limit());
         }

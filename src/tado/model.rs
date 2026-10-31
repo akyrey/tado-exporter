@@ -24,6 +24,28 @@ pub struct ZoneStateApiResponse {
     pub activityDataPoints: ZoneStateActivityDataPointsApiResponse,
     pub sensorDataPoints: ZoneStateSensorDataPointsApiResponse,
     pub openWindow: Option<ZoneStateOpenWindowApiResponse>,
+    /// `HOME` or `AWAY`: the home's presence mode as applied to this zone.
+    #[serde(default)]
+    pub tadoMode: Option<String>,
+    /// A manual or timed setting replacing the schedule, if any.
+    #[serde(default)]
+    pub overlay: Option<ZoneOverlayApiResponse>,
+    /// tado° detected an open window that has not been activated yet (no Auto-Assist).
+    #[serde(default)]
+    pub openWindowDetected: Option<bool>,
+}
+
+#[derive(Deserialize, Debug, PartialEq)]
+pub struct ZoneOverlayApiResponse {
+    pub setting: ZoneStateSettingApiResponse,
+    pub termination: OverlayTerminationApiResponse,
+}
+
+#[derive(Deserialize, Debug, PartialEq, Eq)]
+pub struct OverlayTerminationApiResponse {
+    /// `MANUAL`, `TIMER` or `TADO_MODE` (until the next schedule block).
+    #[serde(rename = "type")]
+    pub termination_type: String,
 }
 
 /// Response of `/homes/{id}/zoneStates`: the state of every zone, keyed by zone id.
@@ -47,6 +69,9 @@ pub struct ZoneStateOpenWindowApiResponse {
 pub struct ZoneStateSettingApiResponse {
     #[serde(rename = "type")]
     pub deviceType: String,
+    /// `ON` or `OFF`.
+    #[serde(default)]
+    pub power: Option<String>,
     pub temperature: Option<ZoneStateSettingTemperatureApiResponse>,
 }
 
@@ -109,6 +134,28 @@ pub struct WeatherOutsideTemperatureApiResponse {
 }
 
 pub struct ZoneStateResponse {
+    pub id: i32,
     pub name: String,
     pub state_response: ZoneStateApiResponse,
+}
+
+#[derive(Deserialize, Debug, PartialEq)]
+#[allow(non_snake_case)]
+pub struct MobileDeviceApiResponse {
+    pub settings: MobileDeviceSettingsApiResponse,
+    /// Absent when the phone has not shared its location.
+    #[serde(default)]
+    pub location: Option<MobileDeviceLocationApiResponse>,
+}
+
+#[derive(Deserialize, Debug, PartialEq, Eq)]
+#[allow(non_snake_case)]
+pub struct MobileDeviceSettingsApiResponse {
+    pub geoTrackingEnabled: bool,
+}
+
+#[derive(Deserialize, Debug, PartialEq, Eq)]
+#[allow(non_snake_case)]
+pub struct MobileDeviceLocationApiResponse {
+    pub atHome: bool,
 }

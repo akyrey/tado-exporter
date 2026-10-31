@@ -6,7 +6,7 @@ use super::rate_limit::RateLimit;
 use hyper::{header::CONTENT_TYPE, Body, Request, Response};
 use lazy_static::lazy_static;
 use log::info;
-use prometheus::{Encoder, GaugeVec, TextEncoder};
+use prometheus::{CounterVec, Encoder, GaugeVec, TextEncoder};
 
 lazy_static! {
     pub static ref ACTIVITY_HEATING_POWER: GaugeVec = register_gauge_vec!(
@@ -57,6 +57,12 @@ lazy_static! {
         &["zone", "type"]
     )
     .unwrap();
+    pub static ref AUTOMATION_ACTIONS: CounterVec = register_counter_vec!(
+        "tado_automation_actions_total",
+        "Automation decisions by rule, action and mode (dry_run, applied, failed).",
+        &["rule", "action", "mode"]
+    )
+    .unwrap();
     pub static ref API_RATELIMIT_REMAINING: GaugeVec = register_gauge_vec!(
         "tado_api_ratelimit_remaining",
         "Requests left in the current tado° API quota window.",
@@ -77,14 +83,14 @@ lazy_static! {
     .unwrap();
 }
 
-pub fn set_zones(zones: Vec<ZoneStateResponse>) {
+pub fn set_zones(zones: &[ZoneStateResponse]) {
     for zone in zones {
-        let device_type: String = zone.state_response.setting.deviceType;
+        let device_type: String = zone.state_response.setting.deviceType.clone();
 
         // The setting temperature may be null in the API response, if the
         // zone's heating mode is turned off. If the temperature setting is
         // absent, from the API response we'll simply not set its gauge values.
-        if let Some(setting_temperature) = zone.state_response.setting.temperature {
+        if let Some(setting_temperature) = &zone.state_response.setting.temperature {
             // setting temperature
             let value: f64 = setting_temperature.celsius;
             SETTING_TEMPERATURE
@@ -144,7 +150,7 @@ pub fn set_zones(zones: Vec<ZoneStateResponse>) {
         }
 
         // sensor temperature
-        if let Some(inside_temperature) = zone.state_response.sensorDataPoints.insideTemperature {
+        if let Some(inside_temperature) = &zone.state_response.sensorDataPoints.insideTemperature {
             // celsius
             let value: f64 = inside_temperature.celsius;
             SENSOR_TEMPERATURE
@@ -171,7 +177,7 @@ pub fn set_zones(zones: Vec<ZoneStateResponse>) {
         }
 
         // sensor humidity
-        if let Some(humidity) = zone.state_response.sensorDataPoints.humidity {
+        if let Some(humidity) = &zone.state_response.sensorDataPoints.humidity {
             let value: f64 = humidity.percentage;
             SENSOR_HUMIDITY_PERCENTAGE
                 .with_label_values(&[zone.name.as_str(), device_type.as_str()])
@@ -185,7 +191,7 @@ pub fn set_zones(zones: Vec<ZoneStateResponse>) {
         }
 
         // heating power
-        if let Some(heating_power) = zone.state_response.activityDataPoints.heatingPower {
+        if let Some(heating_power) = &zone.state_response.activityDataPoints.heatingPower {
             let value: f64 = heating_power.percentage;
             ACTIVITY_HEATING_POWER
                 .with_label_values(&[zone.name.as_str(), device_type.as_str()])
@@ -199,7 +205,7 @@ pub fn set_zones(zones: Vec<ZoneStateResponse>) {
         }
 
         // ac power
-        if let Some(ac_power) = zone.state_response.activityDataPoints.acPower {
+        if let Some(ac_power) = &zone.state_response.activityDataPoints.acPower {
             let value: f64 = match ac_power.value.as_str() {
                 "ON" => 1.0,
                 "OFF" => 0.0,
@@ -219,7 +225,7 @@ pub fn set_zones(zones: Vec<ZoneStateResponse>) {
     }
 }
 
-pub fn set_weather(weather_response: Option<WeatherApiResponse>) {
+pub fn set_weather(weather_response: Option<&WeatherApiResponse>) {
     if let Some(weather) = weather_response {
         // setting solar intensity
         let solar_intensity_percentage = weather.solarIntensity.percentage;
@@ -274,6 +280,12 @@ pub fn set_rate_limit(rate_limit: Option<&RateLimit>) {
     API_RATELIMIT_RESET_SECONDS
         .with_label_values(&[])
         .set(limit.reset_seconds.unwrap_or(0) as f64);
+}
+
+pub fn record_automation_action(rule: &str, action: &str, mode: &str) {
+    AUTOMATION_ACTIONS
+        .with_label_values(&[rule, action, mode])
+        .inc();
 }
 
 pub async fn renderer(_req: Request<Body>) -> Result<Response<Body>, Infallible> {
@@ -340,7 +352,7 @@ mod tests {
         };
 
         // Act
-        set_weather(Some(weather_response));
+        set_weather(Some(&weather_response));
 
         // Assert
         assert_eq!(
