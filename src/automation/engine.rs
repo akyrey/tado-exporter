@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use log::info;
 
 use super::config::AutomationConfig;
-use super::rules::{open_window, season};
+use super::rules::{humidity, open_window, season};
 use super::state::{self, AutomationState, OverlayInfo, StateStore};
 use super::{Action, Decision, PhoneLocation, Presence, Snapshot, Timestamp, ZoneSnapshot};
 use crate::tado::model::{MobileDeviceApiResponse, WeatherApiResponse, ZoneStateResponse};
@@ -98,6 +98,13 @@ pub fn evaluate(
         |s| open_window::evaluate(snapshot, s),
         &mut proposed,
     );
+    let humidity = run_rule(
+        config.humidity.enabled,
+        humidity::NAME,
+        &state.humidity,
+        |s| humidity::evaluate(&config.humidity, snapshot, s),
+        &mut proposed,
+    );
     let season = run_rule(
         config.season.enabled,
         season::NAME,
@@ -110,6 +117,7 @@ pub fn evaluate(
         decisions: without_conflicts(proposed),
         state: AutomationState {
             open_window,
+            humidity,
             season,
             ..state
         },

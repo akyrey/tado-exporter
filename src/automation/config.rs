@@ -7,6 +7,7 @@ use std::env;
 use std::fmt::Display;
 use std::str::FromStr;
 
+use super::rules::humidity::HumidityConfig;
 use super::rules::open_window::OpenWindowConfig;
 use super::rules::season::SeasonConfig;
 
@@ -19,6 +20,7 @@ pub struct AutomationConfig {
     pub state_path: String,
     pub open_window: OpenWindowConfig,
     pub season: SeasonConfig,
+    pub humidity: HumidityConfig,
 }
 
 impl AutomationConfig {
@@ -33,14 +35,16 @@ impl AutomationConfig {
                 .unwrap_or_else(|| DEFAULT_STATE_PATH.to_string()),
             open_window: OpenWindowConfig::from_lookup(&lookup),
             season: SeasonConfig::from_lookup(&lookup),
+            humidity: HumidityConfig::from_lookup(&lookup),
         }
     }
 
     pub fn any_rule_enabled(&self) -> bool {
-        self.open_window.enabled || self.season.enabled
+        self.open_window.enabled || self.season.enabled || self.humidity.enabled
     }
 
     pub fn print(&self) {
+        let humidity = &self.humidity;
         println!("Automation dry-run: {}", self.dry_run);
         println!("Automation state path: {}", self.state_path);
         println!("Automation open-window: {}", self.open_window.enabled);
@@ -50,6 +54,15 @@ impl AutomationConfig {
             self.season.on_below,
             self.season.off_above,
             self.season.window_hours
+        );
+        println!(
+            "Automation humidity: {} (above {}% for {} min: {}°C for {} min, max {}/day)",
+            humidity.enabled,
+            humidity.threshold,
+            humidity.duration_minutes,
+            humidity.boost_celsius,
+            humidity.boost_minutes,
+            humidity.max_boosts_per_day
         );
     }
 }

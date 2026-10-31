@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use log::warn;
 use serde_derive::{Deserialize, Serialize};
 
+use super::rules::humidity::HumidityState;
 use super::rules::open_window::OpenWindowState;
 use super::rules::season::SeasonState;
 use super::{Action, Snapshot, Timestamp, ZoneControl};
@@ -44,6 +45,7 @@ pub struct AutomationState {
     pub owned_overlays: BTreeMap<i32, OwnedOverlay>,
     pub open_window: OpenWindowState,
     pub season: SeasonState,
+    pub humidity: HumidityState,
 }
 
 /// Decides who controls a zone from its current overlay and what this exporter owns.
