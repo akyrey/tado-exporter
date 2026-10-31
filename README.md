@@ -157,6 +157,18 @@ tado° app is left alone; resume the schedule in the app to hand a zone back to 
 The season rule needs a full window of outside temperatures before its first decision; the history
 is persisted, so restarts do not reset it.
 
+Good to know:
+
+- **Switching between dry-run and live** resets what the season, presence and open-window rules
+  remember about recent changes, so a season change seen in dry-run is applied right after going
+  live. The temperature history is kept. Presence adopts the phones' current state without
+  acting.
+- **Failed writes are retried** on the next tick; the rule decides again from scratch.
+- **Ownership is inferred:** the exporter can't tell its own "heating off" apart from an
+  identical one you set by hand afterwards, so re-applying "off" in the app to a zone the
+  automation had switched off keeps it under automation. Set a temperature (or resume the
+  schedule) to take it back.
+
 ## Community welcome
 
 Please feel free to contribute to this project in order to make it evolve. You're very welcome.

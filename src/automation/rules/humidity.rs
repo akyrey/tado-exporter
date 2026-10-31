@@ -15,9 +15,15 @@ pub const NAME: &str = "humidity";
 
 const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_DAY: u64 = 24 * 3600;
-/// Temperature range accepted by tado° heating zones.
+/// Temperature range and step accepted by tado° heating zones.
 const MIN_CELSIUS: f64 = 5.0;
 const MAX_CELSIUS: f64 = 25.0;
+const CELSIUS_STEPS_PER_DEGREE: f64 = 2.0;
+/// Upper bounds for durations, keeping the time arithmetic far from overflow.
+const MAX_DURATION_MINUTES: u64 = 7 * 24 * 60;
+const MAX_BOOST_MINUTES: u64 = 24 * 60;
+/// Observations further apart than this do not prove humidity stayed high in between.
+const MAX_OBSERVATION_GAP_SECONDS: u64 = 3600;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HumidityConfig {
@@ -49,15 +55,22 @@ impl HumidityConfig {
             config.threshold
         );
         assert!(
-            (MIN_CELSIUS..=MAX_CELSIUS).contains(&config.boost_celsius),
-            "AUTOMATION_HUMIDITY_BOOST_CELSIUS must be between {} and {}, got {}",
+            (MIN_CELSIUS..=MAX_CELSIUS).contains(&config.boost_celsius)
+                && (config.boost_celsius * CELSIUS_STEPS_PER_DEGREE).fract() == 0.0,
+            "AUTOMATION_HUMIDITY_BOOST_CELSIUS must be between {} and {} in 0.5 steps, got {}",
             MIN_CELSIUS,
             MAX_CELSIUS,
             config.boost_celsius
         );
         assert!(
-            config.boost_minutes > 0,
-            "AUTOMATION_HUMIDITY_BOOST_MINUTES must be positive"
+            (1..=MAX_BOOST_MINUTES).contains(&config.boost_minutes),
+            "AUTOMATION_HUMIDITY_BOOST_MINUTES must be between 1 and {}",
+            MAX_BOOST_MINUTES
+        );
+        assert!(
+            config.duration_minutes <= MAX_DURATION_MINUTES,
+            "AUTOMATION_HUMIDITY_DURATION_MINUTES must be at most {}",
+            MAX_DURATION_MINUTES
         );
 
         config
@@ -71,6 +84,8 @@ pub struct HumidityZoneState {
     pub high_since: Option<Timestamp>,
     /// When the boosts of the last 24 hours started.
     pub boosts: Vec<Timestamp>,
+    /// When this zone's humidity was last observed.
+    pub last_seen: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -79,17 +94,21 @@ pub struct HumidityState {
     pub zones: BTreeMap<i32, HumidityZoneState>,
 }
 
+/// `restore_after_boost`: switch heating off again once a boost that replaced an owned "off"
+/// ends. Disabled when the season rule is on, as it decides that based on the season.
 pub fn evaluate(
     config: &HumidityConfig,
     snapshot: &Snapshot,
     state: &HumidityState,
+    restore_after_boost: bool,
 ) -> (Vec<Action>, HumidityState) {
     let results: Vec<(i32, Option<Action>, HumidityZoneState)> = snapshot
         .zones
         .iter()
         .map(|zone| {
             let previous = state.zones.get(&zone.id).cloned().unwrap_or_default();
-            let (action, next) = evaluate_zone(config, snapshot.now, zone, &previous);
+            let (action, next) =
+                evaluate_zone(config, snapshot.now, zone, &previous, restore_after_boost);
             (zone.id, action, next)
         })
         .collect();
@@ -98,9 +117,16 @@ pub fn evaluate(
         .iter()
         .filter_map(|(_, action, _)| action.clone())
         .collect();
-    let zones = results
+    // Zones missing from this snapshot keep their state (a partial response is no reset).
+    let zones = state
+        .zones
+        .clone()
         .into_iter()
-        .map(|(id, _, zone_state)| (id, zone_state))
+        .chain(
+            results
+                .into_iter()
+                .map(|(id, _, zone_state)| (id, zone_state)),
+        )
         .collect();
 
     (actions, HumidityState { zones })
@@ -111,6 +137,7 @@ fn evaluate_zone(
     now: Timestamp,
     zone: &ZoneSnapshot,
     state: &HumidityZoneState,
+    restore_after_boost: bool,
 ) -> (Option<Action>, HumidityZoneState) {
     let recent_boosts: Vec<Timestamp> = state
         .boosts
@@ -118,10 +145,17 @@ fn evaluate_zone(
         .copied()
         .filter(|at| now.saturating_sub(*at) < SECONDS_PER_DAY)
         .collect();
+    let observed_continuously = state
+        .last_seen
+        .is_some_and(|seen| now.saturating_sub(seen) <= MAX_OBSERVATION_GAP_SECONDS);
     let high_since = match zone.humidity {
-        Some(humidity) if humidity > config.threshold => state.high_since.or(Some(now)),
+        Some(humidity) if humidity > config.threshold => state
+            .high_since
+            .filter(|_| observed_continuously)
+            .or(Some(now)),
         _ => None,
     };
+    let last_seen = zone.humidity.map(|_| now).or(state.last_seen);
 
     let humid_long_enough = high_since.is_some_and(|since| {
         now.saturating_sub(since) >= config.duration_minutes * SECONDS_PER_MINUTE
@@ -147,13 +181,16 @@ fn evaluate_zone(
         let next = HumidityZoneState {
             high_since: None,
             boosts,
+            last_seen,
         };
         return (Some(action), next);
     }
 
     // A boost that replaced an owned "off" has ended: switch heating off again.
     let restore = match zone.control {
-        ZoneControl::BoostEnded { then_off: true } => Some(Action::HeatingOff { zone: zone.id }),
+        ZoneControl::BoostEnded { then_off: true } if restore_after_boost => {
+            Some(Action::HeatingOff { zone: zone.id })
+        }
         _ => None,
     };
 
@@ -162,6 +199,7 @@ fn evaluate_zone(
         HumidityZoneState {
             high_since,
             boosts: recent_boosts,
+            last_seen,
         },
     )
 }
@@ -220,6 +258,7 @@ mod tests {
                 HumidityZoneState {
                     high_since: Some(NOW - minutes_ago * MINUTE),
                     boosts,
+                    last_seen: Some(NOW - 5 * MINUTE),
                 },
             )]
             .iter()
@@ -244,6 +283,7 @@ mod tests {
             &config(),
             &snapshot(zone(ZoneControl::Schedule, 70.0, None)),
             &HumidityState::default(),
+            true,
         );
 
         // Assert
@@ -258,6 +298,7 @@ mod tests {
             &config(),
             &snapshot(zone(ZoneControl::Schedule, 60.0, None)),
             &humid_since(170, vec![]),
+            true,
         );
 
         // Assert
@@ -281,6 +322,7 @@ mod tests {
             &config(),
             &snapshot(zone(control, 70.0, setting)),
             &humid_since(180, vec![]),
+            true,
         );
 
         // Assert
@@ -302,11 +344,13 @@ mod tests {
             &config(),
             &snapshot(zone(ZoneControl::Schedule, 70.0, None)),
             &humid_since(180, earlier_today),
+            true,
         );
         let (allowed, state) = evaluate(
             &config(),
             &snapshot(zone(ZoneControl::Schedule, 70.0, None)),
             &humid_since(180, yesterday),
+            true,
         );
 
         // Assert
@@ -322,7 +366,12 @@ mod tests {
         humid_zone.open_window_detected = true;
 
         // Act
-        let (actions, _) = evaluate(&config(), &snapshot(humid_zone), &humid_since(180, vec![]));
+        let (actions, _) = evaluate(
+            &config(),
+            &snapshot(humid_zone),
+            &humid_since(180, vec![]),
+            true,
+        );
 
         // Assert
         assert!(actions.is_empty());
@@ -339,6 +388,7 @@ mod tests {
                 Some(20.0),
             )),
             &HumidityState::default(),
+            true,
         );
 
         // Assert
@@ -346,8 +396,65 @@ mod tests {
     }
 
     #[test]
+    fn leaves_restore_to_the_season_rule_when_enabled() {
+        // Act
+        let (actions, _) = evaluate(
+            &config(),
+            &snapshot(zone(
+                ZoneControl::BoostEnded { then_off: true },
+                50.0,
+                Some(20.0),
+            )),
+            &HumidityState::default(),
+            false,
+        );
+
+        // Assert
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn restarts_tracking_after_an_observation_gap() {
+        // Arrange: humid for long enough, but the last observation is 2 hours old.
+        let mut state = humid_since(400, vec![]);
+        state.zones.get_mut(&4).unwrap().last_seen = Some(NOW - 120 * MINUTE);
+
+        // Act
+        let (actions, state) = evaluate(
+            &config(),
+            &snapshot(zone(ZoneControl::Schedule, 70.0, None)),
+            &state,
+            true,
+        );
+
+        // Assert
+        assert!(actions.is_empty());
+        assert_eq!(state.zones[&4].high_since, Some(NOW));
+    }
+
+    #[test]
+    fn keeps_state_of_zones_missing_from_the_snapshot() {
+        // Arrange
+        let mut state = humid_since(100, vec![NOW - 60 * MINUTE]);
+        state.zones.insert(9, state.zones[&4].clone());
+
+        // Act
+        let (_, next) = evaluate(
+            &config(),
+            &snapshot(zone(ZoneControl::Schedule, 70.0, None)),
+            &state,
+            true,
+        );
+
+        // Assert
+        assert_eq!(next.zones[&9], state.zones[&9]);
+    }
+
+    #[rstest]
+    #[case("30")]
+    #[case("21.3")]
     #[should_panic(expected = "AUTOMATION_HUMIDITY_BOOST_CELSIUS must be between")]
-    fn rejects_out_of_range_boost() {
-        HumidityConfig::from_lookup(&lookup(&[("AUTOMATION_HUMIDITY_BOOST_CELSIUS", "30")]));
+    fn rejects_invalid_boost_temperature(#[case] value: &str) {
+        HumidityConfig::from_lookup(&lookup(&[("AUTOMATION_HUMIDITY_BOOST_CELSIUS", value)]));
     }
 }

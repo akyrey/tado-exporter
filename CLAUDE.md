@@ -43,10 +43,13 @@ Rust is installed via rustup (`~/.cargo/bin`); if `cargo` isn't on PATH, prepend
 
 ## Automation invariants
 
-- **Manual always wins.** A zone's overlay counts as *owned* only if `AutomationState::owned_overlays` records it **and** it still matches (`state::zone_control`). Rules may change `Schedule`, `Owned` and `BoostEnded` zones, never `Manual` ones. Only `record_applied` (after a successful live write) adds ownership. `reconcile` drops ownership of overlays that vanished or were replaced.
+- **Manual always wins.** A zone's overlay counts as *owned* only if `AutomationState::owned_overlays` records it **and** it still matches (`state::zone_control`). Rules may change `Schedule`, `Owned` and `BoostEnded` zones, never `Manual` ones. An owned boost that disappears before its `until` (minus slack) was cancelled by hand, so it becomes `Schedule`, not `BoostEnded`.
+- **Ownership changes only after a successful live write** (`record_applied`). `reconcile` runs in the executor after applying. It drops vanished or replaced overlays, but keeps zones missing from the snapshot and ended boosts whose follow-up action was not applied (`pending_restore`).
+- **Unapplied decisions are retried.** A failed write, or an action dropped by `without_conflicts`, restores that rule's previous state (`with_rules_from`), so the rule decides again next tick.
 - **Rules are pure:** `evaluate(config, snapshot, state) -> (Vec<Action>, NextState)`, with no I/O or clock reads (time comes from `Snapshot::now`). Test them with hand-built snapshots.
-- **Act on edges, not levels.** Season and presence act on *changes*, so a manual change in the app persists. Level-triggered retries may only touch owned overlays.
-- **Dry-run (default) never writes to the API,** but rule state still advances. `executor` tests assert both modes against wiremock.
+- **Act on edges, not levels.** Season and presence act on *changes*, so a manual change in the app persists. Level-triggered retries may only touch owned overlays. Presence adopts its first observation without acting.
+- **Dry-run (default) never writes to the API,** but rule state still advances. The state records its mode, and `for_mode` resets edge memory when the mode changes. `executor` tests cover live success, failure, dry-run and the dry-run to live switch against wiremock.
+- **Rule priority:** open_window, humidity, season, presence. When the season rule is enabled, it alone decides what follows a boost (humidity's `restore_after_boost` is off).
 - **Every extra read counts against the daily quota.** `Engine::needs_phones` gates the mobile-devices request.
 
 ## Conventions
