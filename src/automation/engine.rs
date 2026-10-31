@@ -5,8 +5,9 @@ use std::collections::HashSet;
 use log::info;
 
 use super::config::AutomationConfig;
+use super::rules::open_window;
 use super::state::{self, AutomationState, OverlayInfo, StateStore};
-use super::{Decision, PhoneLocation, Presence, Snapshot, Timestamp, ZoneSnapshot};
+use super::{Action, Decision, PhoneLocation, Presence, Snapshot, Timestamp, ZoneSnapshot};
 use crate::tado::model::{MobileDeviceApiResponse, WeatherApiResponse, ZoneStateResponse};
 
 /// The outcome of one evaluation: what to do, and the rule state to keep afterwards.
@@ -83,17 +84,34 @@ impl Engine {
 
 /// Runs every enabled rule. Rules earlier in the list win when two touch the same zone.
 pub fn evaluate(
-    _config: &AutomationConfig,
+    config: &AutomationConfig,
     state: &AutomationState,
     snapshot: &Snapshot,
 ) -> Evaluation {
     let state = state::reconcile(state, snapshot);
-    let proposed: Vec<Decision> = Vec::new();
+    let mut proposed: Vec<Decision> = Vec::new();
+
+    let open_window = if config.open_window.enabled {
+        let (actions, rule_state) = open_window::evaluate(snapshot, &state.open_window);
+        proposed.extend(decisions(open_window::NAME, actions));
+        rule_state
+    } else {
+        state.open_window.clone()
+    };
 
     Evaluation {
         decisions: without_conflicts(proposed),
-        state,
+        state: AutomationState {
+            open_window,
+            ..state
+        },
     }
+}
+
+fn decisions(rule: &'static str, actions: Vec<Action>) -> impl Iterator<Item = Decision> {
+    actions
+        .into_iter()
+        .map(move |action| Decision { rule, action })
 }
 
 /// Keeps only the first action per zone (and the first presence change).
@@ -231,6 +249,7 @@ mod tests {
         ];
         let state = AutomationState {
             owned_overlays: [(3, OwnedOverlay::Off)].iter().copied().collect(),
+            ..AutomationState::default()
         };
         let weather = WeatherApiResponse {
             solarIntensity: WeatherSolarIntensityApiResponse { percentage: 0.0 },

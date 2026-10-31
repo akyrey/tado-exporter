@@ -11,6 +11,7 @@
 pub mod config;
 pub mod engine;
 pub mod executor;
+pub mod rules;
 pub mod state;
 
 use serde_derive::{Deserialize, Serialize};
