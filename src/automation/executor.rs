@@ -143,6 +143,108 @@ mod tests {
         }
     }
 
+    use crate::automation::config::tests::lookup;
+    use crate::automation::config::AutomationConfig;
+    use crate::tado::auth::Authenticator;
+    use crate::tado::token_store::TokenStore;
+    use serde_json::json;
+    use tempfile::TempDir;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn prepared_client(server: &MockServer, dir: &TempDir) -> Client {
+        let store = TokenStore::new(dir.path().join("token.json"));
+        store.save("refresh-1").unwrap();
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-1", "expires_in": 599, "refresh_token": "refresh-2"
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/me"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "homes": [{ "id": 42 }] })),
+            )
+            .mount(server)
+            .await;
+
+        let http_client = reqwest::Client::new();
+        let auth_url = format!("{}/oauth2/", server.uri()).parse().unwrap();
+        let authenticator = Authenticator::with_base_url(http_client.clone(), auth_url, store);
+        let mut client =
+            Client::with_base_url(http_client, server.uri().parse().unwrap(), authenticator);
+        assert!(client.prepare().await);
+        client
+    }
+
+    fn zone_with_open_window() -> Vec<ZoneStateResponse> {
+        vec![ZoneStateResponse {
+            id: 1,
+            name: "Salotto".to_string(),
+            state_response: serde_json::from_value(json!({
+                "tadoMode": "HOME",
+                "setting": { "type": "HEATING", "power": "ON", "temperature": { "celsius": 20.0, "fahrenheit": 68.0 } },
+                "activityDataPoints": {},
+                "sensorDataPoints": {},
+                "openWindowDetected": true
+            }))
+            .unwrap(),
+        }]
+    }
+
+    async fn run_open_window_tick(dry_run: &str, expected_calls: u64) -> String {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        Mock::given(method("POST"))
+            .and(path("/api/v2/homes/42/zones/1/state/openWindow/activate"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(expected_calls)
+            .mount(&server)
+            .await;
+        let mut client = prepared_client(&server, &dir).await;
+        let state_path = dir.path().join("automation.json");
+        let state_path_str = state_path.to_str().unwrap().to_string();
+        let config = AutomationConfig::from_lookup(lookup(&[
+            ("AUTOMATION_DRY_RUN", dry_run),
+            ("AUTOMATION_OPEN_WINDOW_ENABLED", "true"),
+            ("AUTOMATION_STATE_PATH", state_path_str.as_str()),
+        ]));
+        let mut engine = Engine::new(config);
+
+        run_tick(
+            &mut engine,
+            &mut client,
+            &zone_with_open_window(),
+            None,
+            None,
+        )
+        .await;
+
+        std::fs::read_to_string(state_path).unwrap()
+    }
+
+    #[tokio::test]
+    async fn live_mode_applies_decisions_and_persists_state() {
+        // Act
+        let state = run_open_window_tick("false", 1).await;
+
+        // Assert: the mock verifies the call on drop
+        let state: serde_json::Value = serde_json::from_str(&state).unwrap();
+        assert_eq!(state["open_window"]["handled"], json!([1]));
+    }
+
+    #[tokio::test]
+    async fn dry_run_never_calls_the_api() {
+        // Act
+        let state = run_open_window_tick("true", 0).await;
+
+        // Assert: the mock verifies no call was made on drop
+        let state: serde_json::Value = serde_json::from_str(&state).unwrap();
+        assert_eq!(state["open_window"]["handled"], json!([1]));
+    }
+
     #[test]
     fn describes_decisions_with_zone_names() {
         let boost = Decision {

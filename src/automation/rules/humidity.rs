@@ -123,7 +123,7 @@ fn evaluate_zone(
         _ => None,
     };
 
-    let humid_long_enough = high_since.map_or(false, |since| {
+    let humid_long_enough = high_since.is_some_and(|since| {
         now.saturating_sub(since) >= config.duration_minutes * SECONDS_PER_MINUTE
     });
     let can_boost = recent_boosts.len() < config.max_boosts_per_day
@@ -132,7 +132,7 @@ fn evaluate_zone(
         && !zone.open_window_active
         && zone
             .setting_celsius
-            .map_or(true, |celsius| celsius < config.boost_celsius);
+            .is_none_or(|celsius| celsius < config.boost_celsius);
 
     if humid_long_enough && can_boost {
         let then_off = boostable_control(zone.control).unwrap_or(false);

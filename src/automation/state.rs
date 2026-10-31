@@ -10,6 +10,7 @@ use serde_derive::{Deserialize, Serialize};
 
 use super::rules::humidity::HumidityState;
 use super::rules::open_window::OpenWindowState;
+use super::rules::presence::PresenceState;
 use super::rules::season::SeasonState;
 use super::{Action, Snapshot, Timestamp, ZoneControl};
 use crate::persist::write_private_atomic;
@@ -46,6 +47,7 @@ pub struct AutomationState {
     pub open_window: OpenWindowState,
     pub season: SeasonState,
     pub humidity: HumidityState,
+    pub presence: PresenceState,
 }
 
 /// Decides who controls a zone from its current overlay and what this exporter owns.
@@ -67,7 +69,7 @@ fn is_same_overlay(owned: OwnedOverlay, overlay: &OverlayInfo) -> bool {
             overlay.termination == "TIMER"
                 && overlay
                     .celsius
-                    .map_or(false, |c| (c - celsius).abs() < CELSIUS_TOLERANCE)
+                    .is_some_and(|c| (c - celsius).abs() < CELSIUS_TOLERANCE)
         }
     }
 }
@@ -80,7 +82,7 @@ pub fn reconcile(state: &AutomationState, snapshot: &Snapshot) -> AutomationStat
         .filter(|(id, _)| {
             snapshot
                 .zone(**id)
-                .map_or(false, |zone| matches!(zone.control, ZoneControl::Owned(_)))
+                .is_some_and(|zone| matches!(zone.control, ZoneControl::Owned(_)))
         })
         .map(|(id, overlay)| (*id, *overlay))
         .collect();

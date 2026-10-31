@@ -3,4 +3,5 @@
 
 pub mod humidity;
 pub mod open_window;
+pub mod presence;
 pub mod season;
