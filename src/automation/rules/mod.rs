@@ -2,3 +2,4 @@
 //! own persisted state, returning the actions to take and its next state.
 
 pub mod open_window;
+pub mod season;

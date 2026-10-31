@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use log::info;
 
 use super::config::AutomationConfig;
-use super::rules::open_window;
+use super::rules::{open_window, season};
 use super::state::{self, AutomationState, OverlayInfo, StateStore};
 use super::{Action, Decision, PhoneLocation, Presence, Snapshot, Timestamp, ZoneSnapshot};
 use crate::tado::model::{MobileDeviceApiResponse, WeatherApiResponse, ZoneStateResponse};
@@ -91,27 +91,46 @@ pub fn evaluate(
     let state = state::reconcile(state, snapshot);
     let mut proposed: Vec<Decision> = Vec::new();
 
-    let open_window = if config.open_window.enabled {
-        let (actions, rule_state) = open_window::evaluate(snapshot, &state.open_window);
-        proposed.extend(decisions(open_window::NAME, actions));
-        rule_state
-    } else {
-        state.open_window.clone()
-    };
+    let open_window = run_rule(
+        config.open_window.enabled,
+        open_window::NAME,
+        &state.open_window,
+        |s| open_window::evaluate(snapshot, s),
+        &mut proposed,
+    );
+    let season = run_rule(
+        config.season.enabled,
+        season::NAME,
+        &state.season,
+        |s| season::evaluate(&config.season, snapshot, s),
+        &mut proposed,
+    );
 
     Evaluation {
         decisions: without_conflicts(proposed),
         state: AutomationState {
             open_window,
+            season,
             ..state
         },
     }
 }
 
-fn decisions(rule: &'static str, actions: Vec<Action>) -> impl Iterator<Item = Decision> {
-    actions
-        .into_iter()
-        .map(move |action| Decision { rule, action })
+/// Runs a rule if enabled, collecting its decisions; a disabled rule keeps its state.
+fn run_rule<S: Clone>(
+    enabled: bool,
+    rule: &'static str,
+    state: &S,
+    evaluate: impl FnOnce(&S) -> (Vec<Action>, S),
+    proposed: &mut Vec<Decision>,
+) -> S {
+    if !enabled {
+        return state.clone();
+    }
+
+    let (actions, next_state) = evaluate(state);
+    proposed.extend(actions.into_iter().map(|action| Decision { rule, action }));
+    next_state
 }
 
 /// Keeps only the first action per zone (and the first presence change).
