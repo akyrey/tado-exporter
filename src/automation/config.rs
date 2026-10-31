@@ -7,6 +7,8 @@ use std::env;
 use std::fmt::Display;
 use std::str::FromStr;
 
+use super::rules::open_window::OpenWindowConfig;
+
 const DEFAULT_STATE_PATH: &str = "tado-automation.json";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -14,6 +16,7 @@ pub struct AutomationConfig {
     /// Only log what the rules would do. On by default.
     pub dry_run: bool,
     pub state_path: String,
+    pub open_window: OpenWindowConfig,
 }
 
 impl AutomationConfig {
@@ -26,16 +29,18 @@ impl AutomationConfig {
             dry_run: parse_bool(&lookup, "AUTOMATION_DRY_RUN", true),
             state_path: lookup("AUTOMATION_STATE_PATH")
                 .unwrap_or_else(|| DEFAULT_STATE_PATH.to_string()),
+            open_window: OpenWindowConfig::from_lookup(&lookup),
         }
     }
 
     pub fn any_rule_enabled(&self) -> bool {
-        false
+        self.open_window.enabled
     }
 
     pub fn print(&self) {
         println!("Automation dry-run: {}", self.dry_run);
         println!("Automation state path: {}", self.state_path);
+        println!("Automation open-window: {}", self.open_window.enabled);
     }
 }
 
