@@ -2,10 +2,12 @@
 //! a new browser authorization.
 
 use std::fs;
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::PathBuf;
 
 use serde_derive::{Deserialize, Serialize};
+
+use crate::persist::write_private_atomic;
 
 #[derive(Serialize, Deserialize)]
 struct StoredToken {
@@ -37,40 +39,13 @@ impl TokenStore {
 
     /// Atomically replaces the stored refresh token. The file is readable by its owner only.
     pub fn save(&self, refresh_token: &str) -> io::Result<()> {
-        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)?;
-        }
-
         let stored = StoredToken {
             refresh_token: refresh_token.to_string(),
         };
         let contents = serde_json::to_vec(&stored)?;
 
-        let tmp_path = self.path.with_extension("tmp");
-        write_private(&tmp_path, &contents)?;
-        fs::rename(&tmp_path, &self.path)
+        write_private_atomic(&self.path, &contents)
     }
-}
-
-fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
-    // A leftover file could carry looser permissions; always create it fresh with 0600.
-    match fs::remove_file(path) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-        _ => {}
-    }
-
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-
-    let mut file = options.open(path)?;
-    file.write_all(contents)?;
-    file.sync_all()
 }
 
 #[cfg(test)]

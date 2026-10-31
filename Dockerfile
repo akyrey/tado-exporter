@@ -58,8 +58,10 @@ RUN echo "builder-$TARGETARCH$TARGETVARIANT"
 COPY --from=final-builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=final-builder /tado-exporter /usr/bin/
 
-# The rotating tado° refresh token is persisted here; mount a volume to survive restarts.
+# The rotating tado° refresh token and the automation state are persisted here; mount a
+# volume to survive restarts.
 ENV EXPORTER_TOKEN_PATH=/data/tado-token.json
+ENV AUTOMATION_STATE_PATH=/data/tado-automation.json
 VOLUME /data
 
 CMD ["tado-exporter"]
