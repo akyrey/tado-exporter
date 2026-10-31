@@ -1,6 +1,7 @@
 use std::convert::Infallible;
 
 use super::model::{WeatherApiResponse, ZoneStateResponse};
+use super::rate_limit::RateLimit;
 
 use hyper::{header::CONTENT_TYPE, Body, Request, Response};
 use lazy_static::lazy_static;
@@ -54,6 +55,24 @@ lazy_static! {
         "tado_sensor_window_opened",
         "1 if the sensor detected a window is open, 0 otherwise.",
         &["zone", "type"]
+    )
+    .unwrap();
+    pub static ref API_RATELIMIT_REMAINING: GaugeVec = register_gauge_vec!(
+        "tado_api_ratelimit_remaining",
+        "Requests left in the current tado° API quota window.",
+        &[]
+    )
+    .unwrap();
+    pub static ref API_RATELIMIT_QUOTA: GaugeVec = register_gauge_vec!(
+        "tado_api_ratelimit_quota",
+        "Requests allowed per tado° API quota window.",
+        &[]
+    )
+    .unwrap();
+    pub static ref API_RATELIMIT_RESET_SECONDS: GaugeVec = register_gauge_vec!(
+        "tado_api_ratelimit_reset_seconds",
+        "Seconds until the exhausted tado° API quota refills, 0 while requests remain.",
+        &[]
     )
     .unwrap();
 }
@@ -235,6 +254,28 @@ pub fn set_weather(weather_response: Option<WeatherApiResponse>) {
     }
 }
 
+pub fn set_rate_limit(rate_limit: Option<&RateLimit>) {
+    let limit = match rate_limit {
+        Some(limit) => limit,
+        None => return,
+    };
+
+    if let Some(remaining) = limit.remaining {
+        API_RATELIMIT_REMAINING
+            .with_label_values(&[])
+            .set(remaining as f64);
+        info!("-> tado° API requests remaining today: {}", remaining);
+    }
+
+    if let Some(quota) = limit.quota {
+        API_RATELIMIT_QUOTA.with_label_values(&[]).set(quota as f64);
+    }
+
+    API_RATELIMIT_RESET_SECONDS
+        .with_label_values(&[])
+        .set(limit.reset_seconds.unwrap_or(0) as f64);
+}
+
 pub async fn renderer(_req: Request<Body>) -> Result<Response<Body>, Infallible> {
     let metrics = prometheus::gather();
     let mut buffer = vec![];
@@ -259,15 +300,37 @@ mod tests {
 
     use super::*;
 
+    use std::sync::Mutex;
+
+    /// Serializes tests that write the weather gauges, so snapshots are not interleaved.
+    static WEATHER_LOCK: Mutex<()> = Mutex::new(());
+
+    // The Prometheus registry is global and shared by all tests in this binary, so tests look
+    // metrics up by name instead of asserting on the whole registry.
+    fn gauge_values(name: &str) -> Vec<(Vec<(String, String)>, f64)> {
+        prometheus::gather()
+            .into_iter()
+            .filter(|family| family.get_name() == name)
+            .flat_map(|family| family.get_metric().to_vec())
+            .map(|metric| {
+                let labels = metric
+                    .get_label()
+                    .iter()
+                    .map(|l| (l.get_name().to_string(), l.get_value().to_string()))
+                    .collect();
+                (labels, metric.get_gauge().get_value())
+            })
+            .collect()
+    }
+
+    fn unit(value: &str) -> Vec<(String, String)> {
+        vec![("unit".to_string(), value.to_string())]
+    }
+
     #[test]
     fn test_set_weather_some() {
-        /*
-        GIVEN a weather response
-        WHEN set_weather is called
-        THEN the metrics are set
-        */
-
-        // GIVEN
+        // Arrange
+        let _guard = WEATHER_LOCK.lock().unwrap();
         let weather_response = WeatherApiResponse {
             solarIntensity: WeatherSolarIntensityApiResponse { percentage: 100.0 },
             outsideTemperature: WeatherOutsideTemperatureApiResponse {
@@ -276,58 +339,64 @@ mod tests {
             },
         };
 
-        // WHEN
+        // Act
         set_weather(Some(weather_response));
 
-        // THEN
-        // Check metrics
-        let metrics = prometheus::gather();
-
-        assert_eq!(metrics.len(), 2);
-        assert_eq!(metrics[0].get_name(), "weather_outside_temperature");
-        assert_eq!(metrics[1].get_name(), "weather_solar_intensity");
-
-        // Check outside temperature metric
-        let outside_temperature_metric = metrics[0].get_metric();
-
-        assert_eq!(outside_temperature_metric.len(), 2);
-
-        let outside_temp_celsius = &outside_temperature_metric[0];
-        let outside_temp_fahrenheit = &outside_temperature_metric[1];
-
-        assert_eq!(outside_temp_celsius.get_label().len(), 1);
-        assert_eq!(outside_temp_celsius.get_label()[0].get_name(), "unit");
-        assert_eq!(outside_temp_celsius.get_label()[0].get_value(), "celsius");
-        assert_eq!(outside_temp_celsius.get_gauge().get_value(), 20.0);
-        assert_eq!(outside_temp_fahrenheit.get_label().len(), 1);
-        assert_eq!(outside_temp_fahrenheit.get_label()[0].get_name(), "unit");
+        // Assert
         assert_eq!(
-            outside_temp_fahrenheit.get_label()[0].get_value(),
-            "fahrenheit"
+            gauge_values("weather_outside_temperature"),
+            vec![(unit("celsius"), 20.0), (unit("fahrenheit"), 68.0)]
         );
-        assert_eq!(outside_temp_fahrenheit.get_gauge().get_value(), 68.0);
-
-        // Check solar intensity metric
-        let solar_intensity_metric = metrics[1].get_metric();
-
-        assert_eq!(solar_intensity_metric.len(), 1);
-        assert_eq!(solar_intensity_metric[0].get_gauge().get_value(), 100.0);
+        assert_eq!(
+            gauge_values("weather_solar_intensity"),
+            vec![(vec![], 100.0)]
+        );
     }
 
     #[test]
-    fn test_set_weather_none() {
-        /*
-        GIVEN no weather response
-        WHEN set_weather is called
-        THEN the metrics are not set
-        */
+    fn test_set_weather_none_leaves_metrics_untouched() {
+        // Arrange
+        let _guard = WEATHER_LOCK.lock().unwrap();
+        let before = gauge_values("weather_outside_temperature");
 
-        // WHEN
+        // Act
         set_weather(None);
 
-        // THEN
-        let metrics = prometheus::gather();
+        // Assert
+        assert_eq!(gauge_values("weather_outside_temperature"), before);
+    }
 
-        assert_eq!(metrics.len(), 0);
+    #[test]
+    fn test_set_rate_limit() {
+        // Arrange
+        let exhausted = RateLimit {
+            remaining: Some(0),
+            reset_seconds: Some(600),
+            quota: Some(100),
+        };
+        let refilled = RateLimit {
+            remaining: Some(99),
+            reset_seconds: None,
+            quota: None,
+        };
+
+        // Act
+        set_rate_limit(Some(&exhausted));
+        set_rate_limit(Some(&refilled));
+        set_rate_limit(None);
+
+        // Assert
+        assert_eq!(
+            gauge_values("tado_api_ratelimit_remaining"),
+            vec![(vec![], 99.0)]
+        );
+        assert_eq!(
+            gauge_values("tado_api_ratelimit_quota"),
+            vec![(vec![], 100.0)]
+        );
+        assert_eq!(
+            gauge_values("tado_api_ratelimit_reset_seconds"),
+            vec![(vec![], 0.0)]
+        );
     }
 }

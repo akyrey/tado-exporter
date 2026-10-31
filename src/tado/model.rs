@@ -1,4 +1,5 @@
 use serde_derive::Deserialize;
+use std::collections::HashMap;
 
 #[derive(Deserialize, Debug)]
 pub struct MeApiResponse {
@@ -23,6 +24,13 @@ pub struct ZoneStateApiResponse {
     pub activityDataPoints: ZoneStateActivityDataPointsApiResponse,
     pub sensorDataPoints: ZoneStateSensorDataPointsApiResponse,
     pub openWindow: Option<ZoneStateOpenWindowApiResponse>,
+}
+
+/// Response of `/homes/{id}/zoneStates`: the state of every zone, keyed by zone id.
+#[derive(Deserialize, Debug, PartialEq)]
+#[allow(non_snake_case)]
+pub struct ZoneStatesApiResponse {
+    pub zoneStates: HashMap<String, ZoneStateApiResponse>,
 }
 
 #[derive(Deserialize, Debug, PartialEq, Eq)]

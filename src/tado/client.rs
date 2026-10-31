@@ -1,12 +1,15 @@
 use lazy_static::lazy_static;
 use log::{error, info, warn};
 use reqwest::StatusCode;
+use std::collections::HashMap;
 use std::vec::Vec;
 
 use super::auth::Authenticator;
 use super::model::{
-    MeApiResponse, WeatherApiResponse, ZoneStateApiResponse, ZoneStateResponse, ZonesApiResponse,
+    MeApiResponse, WeatherApiResponse, ZoneStateApiResponse, ZoneStateResponse,
+    ZoneStatesApiResponse, ZonesApiResponse,
 };
+use super::rate_limit::RateLimit;
 
 lazy_static! {
     pub static ref BASE_URL: reqwest::Url = "https://my.tado.com/api/v2/".parse().unwrap();
@@ -18,6 +21,10 @@ pub struct Client {
     authenticator: Authenticator,
     access_token: String,
     home_id: i32,
+    /// Zone names by id. Names rarely change, so they are only re-fetched when an
+    /// unknown zone id shows up, which keeps every tick at a single zone request.
+    zone_names: HashMap<i32, String>,
+    rate_limit: Option<RateLimit>,
 }
 
 impl Client {
@@ -36,19 +43,33 @@ impl Client {
             authenticator,
             access_token: String::default(),
             home_id: 0,
+            zone_names: HashMap::new(),
+            rate_limit: None,
         }
     }
 
-    async fn get(&self, url: reqwest::Url) -> Result<reqwest::Response, reqwest::Error> {
-        self.http_client
+    /// The API quota reported by the most recent response that carried quota headers.
+    pub fn rate_limit(&self) -> Option<&RateLimit> {
+        self.rate_limit.as_ref()
+    }
+
+    async fn get(&mut self, url: reqwest::Url) -> Result<reqwest::Response, reqwest::Error> {
+        let response = self
+            .http_client
             .get(url)
             .bearer_auth(&self.access_token)
             .send()
-            .await?
-            .error_for_status()
+            .await?;
+
+        // Record the quota before checking the status: a 429 still reports when it refills.
+        if let Some(rate_limit) = RateLimit::from_headers(response.headers()) {
+            self.rate_limit = Some(rate_limit);
+        }
+
+        response.error_for_status()
     }
 
-    async fn me(&self) -> Result<MeApiResponse, reqwest::Error> {
+    async fn me(&mut self) -> Result<MeApiResponse, reqwest::Error> {
         let url = self.base_url.join("/api/v2/me").unwrap();
         let resp = self.get(url).await?;
 
@@ -64,16 +85,30 @@ impl Client {
         resp.json::<Vec<ZonesApiResponse>>().await
     }
 
-    async fn zone_state(&mut self, zone_id: i32) -> Result<ZoneStateApiResponse, reqwest::Error> {
-        let endpoint = format!("/api/v2/homes/{}/zones/{}/state", self.home_id, zone_id);
+    /// Fetches the state of every zone in a single request.
+    async fn zone_states(&mut self) -> Result<Vec<(i32, ZoneStateApiResponse)>, reqwest::Error> {
+        let endpoint = format!("/api/v2/homes/{}/zoneStates", self.home_id);
         let url = self.base_url.join(&endpoint).unwrap();
 
         let resp = self.get(url).await?;
+        let body = resp.json::<ZoneStatesApiResponse>().await?;
 
-        resp.json::<ZoneStateApiResponse>().await
+        let states = body
+            .zoneStates
+            .into_iter()
+            .filter_map(|(id, state)| match id.parse::<i32>() {
+                Ok(id) => Some((id, state)),
+                Err(_) => {
+                    warn!("ignoring zone state with non-numeric id {:?}", id);
+                    None
+                }
+            })
+            .collect();
+
+        Ok(states)
     }
 
-    async fn weather(&self) -> Result<WeatherApiResponse, reqwest::Error> {
+    async fn weather(&mut self) -> Result<WeatherApiResponse, reqwest::Error> {
         let endpoint = format!("homes/{}/weather/", self.home_id);
         let url = self.base_url.join(&endpoint).unwrap();
 
@@ -119,42 +154,68 @@ impl Client {
     fn handle_api_error(&mut self, context: &str, e: &reqwest::Error) {
         error!("{}: {}", context, e);
 
-        if e.status() == Some(StatusCode::UNAUTHORIZED) {
-            warn!("tado° rejected the access token, it will be renewed on the next tick");
-            self.authenticator.invalidate();
+        match e.status() {
+            Some(StatusCode::UNAUTHORIZED) => {
+                warn!("tado° rejected the access token, it will be renewed on the next tick");
+                self.authenticator.invalidate();
+            }
+            Some(StatusCode::TOO_MANY_REQUESTS) => {
+                let refill = self
+                    .rate_limit
+                    .and_then(|limit| limit.reset_seconds)
+                    .map_or_else(|| "unknown".to_string(), |s| format!("{}s", s));
+                warn!(
+                    "tado° API quota exhausted (refills in {}), consider a longer EXPORTER_TICKER",
+                    refill
+                );
+            }
+            _ => {}
         }
     }
 
+    async fn refresh_zone_names(&mut self) -> Result<(), reqwest::Error> {
+        info!("retrieving zone names...");
+        let zones = self.zones().await?;
+        self.zone_names = zones.into_iter().map(|zone| (zone.id, zone.name)).collect();
+        Ok(())
+    }
+
     pub async fn retrieve_zones(&mut self) -> Vec<ZoneStateResponse> {
-        // retrieve home different zones
-        let zones_response = match self.zones().await {
-            Ok(resp) => resp,
+        info!("retrieving zone states...");
+        let states = match self.zone_states().await {
+            Ok(states) => states,
             Err(e) => {
-                self.handle_api_error("unable to retrieve home zones", &e);
+                self.handle_api_error("unable to retrieve zone states", &e);
                 return Vec::new();
             }
         };
 
-        let mut response = Vec::<ZoneStateResponse>::new();
-
-        for zone in zones_response {
-            info!("retrieving zone details for {}...", zone.name);
-            let zone_state_response = match self.zone_state(zone.id).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    let context = format!("unable to retrieve home zone '{}' state", zone.name);
-                    self.handle_api_error(&context, &e);
-                    return Vec::new();
-                }
-            };
-
-            response.push(ZoneStateResponse {
-                name: zone.name,
-                state_response: zone_state_response,
-            });
+        let has_unknown_zone = states
+            .iter()
+            .any(|(id, _)| !self.zone_names.contains_key(id));
+        if has_unknown_zone {
+            if let Err(e) = self.refresh_zone_names().await {
+                self.handle_api_error("unable to retrieve home zones", &e);
+                return Vec::new();
+            }
         }
 
-        response
+        let mut zones: Vec<ZoneStateResponse> = states
+            .into_iter()
+            .filter_map(|(id, state)| match self.zone_names.get(&id) {
+                Some(name) => Some(ZoneStateResponse {
+                    name: name.clone(),
+                    state_response: state,
+                }),
+                None => {
+                    warn!("ignoring state of zone {} missing from the zone list", id);
+                    None
+                }
+            })
+            .collect();
+        zones.sort_by(|a, b| a.name.cmp(&b.name));
+
+        zones
     }
 
     pub async fn retrieve_weather(&mut self) -> Option<WeatherApiResponse> {
@@ -287,6 +348,84 @@ mod tests {
         assert_eq!(client.home_id, 42);
     }
 
+    fn zone_state_json(celsius: f64) -> serde_json::Value {
+        json!({
+            "setting": { "type": "HEATING", "temperature": null },
+            "activityDataPoints": { "heatingPower": { "percentage": 0.0 } },
+            "sensorDataPoints": {
+                "insideTemperature": { "celsius": celsius, "fahrenheit": 0.0 },
+                "humidity": { "percentage": 50.0 }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn retrieve_zones_uses_one_request_per_tick_and_caches_names() {
+        // Arrange
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        Mock::given(method("GET"))
+            .and(path("/api/v2/homes/42/zoneStates"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "zoneStates": { "1": zone_state_json(20.5), "2": zone_state_json(18.0) }
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/homes/42/zones"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "id": 1, "name": "Salotto" },
+                { "id": 2, "name": "Bagno" }
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut client = authenticated_client(&server, &dir).await;
+        assert!(client.prepare().await);
+
+        // Act
+        let first = client.retrieve_zones().await;
+        let second = client.retrieve_zones().await;
+
+        // Assert
+        let names: Vec<&str> = first.iter().map(|zone| zone.name.as_str()).collect();
+        assert_eq!(names, vec!["Bagno", "Salotto"]);
+        assert_eq!(second.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn records_rate_limit_from_responses_including_errors() {
+        // Arrange
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        Mock::given(method("GET"))
+            .and(path("/homes/42/weather/"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("ratelimit", "\"perday\";r=0;t=600")
+                    .insert_header("ratelimit-policy", "\"perday\";q=100;w=86400"),
+            )
+            .mount(&server)
+            .await;
+        let mut client = authenticated_client(&server, &dir).await;
+        assert!(client.prepare().await);
+
+        // Act
+        let weather = client.retrieve_weather().await;
+
+        // Assert
+        assert!(weather.is_none());
+        assert_eq!(
+            client.rate_limit(),
+            Some(&RateLimit {
+                remaining: Some(0),
+                reset_seconds: Some(600),
+                quota: Some(100),
+            })
+        );
+    }
+
     #[tokio::test]
     async fn unauthorized_response_forces_token_renewal() {
         // Arrange
@@ -373,7 +512,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let (client, _dir) = test_client(mock_server.uri().parse().unwrap());
+        let (mut client, _dir) = test_client(mock_server.uri().parse().unwrap());
 
         // WHEN
         let actual = client.weather().await.unwrap();
@@ -500,26 +639,27 @@ mod tests {
     #[actix_rt::test]
     async fn test_zone_state(response_str: &str, expected: ZoneStateApiResponse) {
         /*
-        GIVEN an OSM client
-        WHEN calling the zone_state() function
-        THEN returns the zone state
+        GIVEN a zoneStates response wrapping a zone state
+        WHEN calling the zone_states() function
+        THEN returns the parsed zone state with its numeric id
         */
 
         // GIVEN
         let mock_server = MockServer::start().await;
+        let body = format!(r#"{{"zoneStates": {{"1": {}}}}}"#, response_str);
 
         Mock::given(method("GET"))
-            .and(path("api/v2/homes/0/zones/0/state"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(response_str, "application/json"))
+            .and(path("api/v2/homes/0/zoneStates"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
             .mount(&mock_server)
             .await;
 
         let (mut client, _dir) = test_client(mock_server.uri().parse().unwrap());
 
         // WHEN
-        let actual = client.zone_state(0).await.unwrap();
+        let actual = client.zone_states().await.unwrap();
 
         // THEN
-        assert_eq!(actual, expected);
+        assert_eq!(actual, vec![(1, expected)]);
     }
 }
