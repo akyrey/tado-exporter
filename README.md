@@ -86,19 +86,20 @@ Token path: tado-token.json
 
 ### API rate limits
 
-tado° limits REST API usage to **100 requests/day** (20,000/day with an Auto-Assist subscription).
-Every tick costs `2 + number of zones` requests (zones list, one state per zone, weather), so choose
-`EXPORTER_TICKER` accordingly: e.g. with 4 zones on the free tier, a tick every 1800 seconds uses 288
-requests/day, which is already too many — use at least 5400 seconds (90 minutes).
+tado° limits REST API usage per day. Their documentation states **100 requests/day** (20,000/day with
+an Auto-Assist subscription), but some accounts currently get a larger transitional quota (e.g.
+1,000/day). The exporter reads the quota from tado°'s response headers and exposes it as
+`tado_api_ratelimit_quota` / `tado_api_ratelimit_remaining`, so check those to see yours.
 
-Once the exporter is running, you also have to update your `prometheus.yml` configuration to let it scrape the exporter:
+Every tick costs **2 requests** (all zone states in one call, plus weather); zone names are cached and
+only re-fetched when a new zone appears. Pick `EXPORTER_TICKER` so that `86400 / ticker * 2` stays
+below your quota with some headroom for restarts:
 
-```yaml
-scrape_configs:
-  - job_name: 'tado'
-    static_configs:
-      - targets: ['localhost:9898']
-```
+| Daily quota | Minimum `EXPORTER_TICKER` | Suggested |
+|---:|---:|---:|
+| 100 | 1728 | 2700 |
+| 1,000 | 173 | 300 |
+| 20,000 | 9 | 60 |
 
 ## Available environment variables
 
@@ -118,6 +119,12 @@ scrape_configs:
 | tado_setting_temperature_value         | This represent the current temperature you asked/programmed in a zone            |
 | tado_sensor_temperature_value          | This represent the current temperature detected by sensor in a zone              |
 | tado_sensor_humidity_percentage        | This represent the current humidity % detected by sensor in a zone               |
+| tado_sensor_window_opened              | 1 if the sensor detected an open window in a zone, 0 otherwise                   |
+| weather_outside_temperature            | Outside temperature at the home's location                                      |
+| weather_solar_intensity                | Solar intensity (%) at the home's location                                      |
+| tado_api_ratelimit_remaining           | tado° API requests left in the current daily window                              |
+| tado_api_ratelimit_quota               | tado° API requests allowed per daily window                                      |
+| tado_api_ratelimit_reset_seconds       | Seconds until an exhausted quota refills (0 while requests remain)               |
 
 ## Community welcome
 

@@ -64,11 +64,11 @@ fn run_ticker(config: config_loader::Config) {
 
         loop {
             ticker.tick().await;
-            if !tado_client.prepare().await {
-                continue;
+            if tado_client.prepare().await {
+                metrics::set_zones(tado_client.retrieve_zones().await);
+                metrics::set_weather(tado_client.retrieve_weather().await);
             }
-            metrics::set_zones(tado_client.retrieve_zones().await);
-            metrics::set_weather(tado_client.retrieve_weather().await);
+            metrics::set_rate_limit(tado_client.rate_limit());
         }
     });
 }
