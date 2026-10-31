@@ -26,6 +26,8 @@ Rust is installed via rustup (`~/.cargo/bin`); if `cargo` isn't on PATH, prepend
 | `src/tado/rate_limit.rs` | Parses `ratelimit` / `ratelimit-policy` headers into `RateLimit` |
 | `src/tado/model.rs` | serde response structs (camelCase fields with `#[allow(non_snake_case)]`) |
 | `src/tado/metrics.rs` | `lazy_static` Prometheus `GaugeVec`s, `set_zones`/`set_weather`, `/metrics` renderer |
+| `src/automation/` | Thermostat automation. `mod.rs`: `Snapshot`/`ZoneControl`/`Action`. `engine.rs`: builds snapshots, runs enabled rules in priority order (first action per zone wins). `executor.rs`: applies decisions or logs them in dry-run. `state.rs`: persisted `AutomationState` and owned-overlay tracking. `rules/`: `open_window`, `humidity`, `season`, `presence` |
+| `src/persist.rs` | Atomic 0600 file writes shared by the token store and automation state |
 
 ## Authentication and API constraints (read before changing the client)
 
@@ -38,6 +40,14 @@ Rust is installed via rustup (`~/.cargo/bin`); if `cargo` isn't on PATH, prepend
 - A 401 from the REST API calls `Authenticator::invalidate()`, which forces a refresh on the next tick.
 - **Rate limits** (tado°, since early 2026): officially 100 req/day on the free tier and 20,000/day with Auto-Assist. The maintainer's free account actually reported **1,000/day** on 2026-10-31. The quota comes from the `ratelimit` (`"perday";r=<left>[;t=<secs-to-refill>]`) and `ratelimit-policy` (`"perday";q=<quota>;w=<window>`) headers, exposed as `tado_api_ratelimit_*` metrics. Each tick costs **2** REST calls (zoneStates + weather), plus `/me` and `/zones` at startup. Token calls go to `login.tado.com`. Budget every new API call.
 - The maintainer has **V3+** devices (`my.tado.com/api/v2`). tado° X devices (`hops.tado.com/.../rooms`) are not supported.
+
+## Automation invariants
+
+- **Manual always wins.** A zone's overlay counts as *owned* only if `AutomationState::owned_overlays` records it **and** it still matches (`state::zone_control`). Rules may change `Schedule`, `Owned` and `BoostEnded` zones, never `Manual` ones. Only `record_applied` (after a successful live write) adds ownership. `reconcile` drops ownership of overlays that vanished or were replaced.
+- **Rules are pure:** `evaluate(config, snapshot, state) -> (Vec<Action>, NextState)`, with no I/O or clock reads (time comes from `Snapshot::now`). Test them with hand-built snapshots.
+- **Act on edges, not levels.** Season and presence act on *changes*, so a manual change in the app persists. Level-triggered retries may only touch owned overlays.
+- **Dry-run (default) never writes to the API,** but rule state still advances. `executor` tests assert both modes against wiremock.
+- **Every extra read counts against the daily quota.** `Engine::needs_phones` gates the mobile-devices request.
 
 ## Conventions
 

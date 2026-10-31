@@ -125,6 +125,37 @@ below your quota with some headroom for restarts:
 | tado_api_ratelimit_remaining           | tado° API requests left in the current daily window                              |
 | tado_api_ratelimit_quota               | tado° API requests allowed per daily window                                      |
 | tado_api_ratelimit_reset_seconds       | Seconds until an exhausted quota refills (0 while requests remain)               |
+| tado_automation_actions_total          | Automation decisions by `rule`, `action` and `mode` (`dry_run`, `applied`, `failed`) |
+
+## Automation
+
+Besides exporting metrics, the exporter can manage the thermostats. Every rule is **off by
+default** and the whole feature runs in **dry-run mode** until `AUTOMATION_DRY_RUN=false`: decisions
+are only logged (`[dry-run] season: turn heating off in Salotto`) and counted in
+`tado_automation_actions_total{mode="dry_run"}`.
+
+**Manual settings always win.** Rules only act on zones that follow their schedule or carry a
+setting the exporter applied itself (tracked in `AUTOMATION_STATE_PATH`). Anything you set in the
+tado° app is left alone; resume the schedule in the app to hand a zone back to the automation.
+
+| Rule | Enable with | What it does | Extra API requests |
+|---|---|---|---|
+| Open window | `AUTOMATION_OPEN_WINDOW_ENABLED=true` | Confirms windows tado° detected (without Auto-Assist tado° only suggests it), pausing heating for the zone's open-window timeout | 1 write per detection |
+| Season | `AUTOMATION_SEASON_ENABLED=true` | Switches scheduled zones off when the mean outside temperature over the window rises above `OFF_ABOVE`, resumes them when it drops below `ON_BELOW`. Acts only when the season changes | none (uses the weather already fetched) |
+| Humidity | `AUTOMATION_HUMIDITY_ENABLED=true` | When a zone stays above `THRESHOLD`% for `DURATION_MINUTES`, heats it to `BOOST_CELSIUS` for `BOOST_MINUTES` (max `MAX_BOOSTS_PER_DAY`), then restores heating off if the season had switched it off | 1–2 writes per boost |
+| Presence | `AUTOMATION_PRESENCE_ENABLED=true` | Sets AWAY once every location-sharing phone has been away for `AWAY_POLLS` ticks, HOME as soon as one returns. Acts only when the phones' presence changes, so a presence set by hand is kept | **+1 read per tick** (raise `EXPORTER_TICKER`, e.g. to 360) |
+
+| Environment variable | Default |
+|---|---|
+| AUTOMATION_DRY_RUN | `true` |
+| AUTOMATION_STATE_PATH | `tado-automation.json` (`/data/tado-automation.json` in Docker) |
+| AUTOMATION_SEASON_ON_BELOW / AUTOMATION_SEASON_OFF_ABOVE / AUTOMATION_SEASON_WINDOW_HOURS | `14` / `17` / `24` |
+| AUTOMATION_HUMIDITY_THRESHOLD / AUTOMATION_HUMIDITY_DURATION_MINUTES | `65` / `180` |
+| AUTOMATION_HUMIDITY_BOOST_CELSIUS / AUTOMATION_HUMIDITY_BOOST_MINUTES / AUTOMATION_HUMIDITY_MAX_BOOSTS_PER_DAY | `21` / `60` / `2` |
+| AUTOMATION_PRESENCE_AWAY_POLLS | `2` |
+
+The season rule needs a full window of outside temperatures before its first decision; the history
+is persisted, so restarts do not reset it.
 
 ## Community welcome
 

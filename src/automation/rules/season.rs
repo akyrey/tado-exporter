@@ -131,9 +131,9 @@ fn updated_samples(config: &SeasonConfig, snapshot: &Snapshot, samples: &[Sample
 /// lies between the thresholds.
 fn decide(config: &SeasonConfig, now: Timestamp, samples: &[Sample]) -> Option<Season> {
     let required_span = config.window_seconds() * COVERAGE_PERCENT / 100;
-    let covered = samples.first().map_or(false, |oldest| {
-        now.saturating_sub(oldest.at) >= required_span
-    });
+    let covered = samples
+        .first()
+        .is_some_and(|oldest| now.saturating_sub(oldest.at) >= required_span);
     if !covered {
         return None;
     }

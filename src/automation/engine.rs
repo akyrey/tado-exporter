@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use log::info;
 
 use super::config::AutomationConfig;
-use super::rules::{humidity, open_window, season};
+use super::rules::{humidity, open_window, presence, season};
 use super::state::{self, AutomationState, OverlayInfo, StateStore};
 use super::{Action, Decision, PhoneLocation, Presence, Snapshot, Timestamp, ZoneSnapshot};
 use crate::tado::model::{MobileDeviceApiResponse, WeatherApiResponse, ZoneStateResponse};
@@ -53,7 +53,7 @@ impl Engine {
 
     /// Whether a rule needs phone locations (one extra API request per tick).
     pub fn needs_phones(&self) -> bool {
-        false
+        self.config.presence.enabled
     }
 
     pub fn snapshot(
@@ -113,12 +113,21 @@ pub fn evaluate(
         &mut proposed,
     );
 
+    let presence = run_rule(
+        config.presence.enabled,
+        presence::NAME,
+        &state.presence,
+        |s| presence::evaluate(&config.presence, snapshot, s),
+        &mut proposed,
+    );
+
     Evaluation {
         decisions: without_conflicts(proposed),
         state: AutomationState {
             open_window,
             humidity,
             season,
+            presence,
             ..state
         },
     }

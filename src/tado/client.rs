@@ -33,7 +33,7 @@ impl Client {
         Client::with_base_url(http_client, BASE_URL.clone(), authenticator)
     }
 
-    fn with_base_url(
+    pub(crate) fn with_base_url(
         http_client: reqwest::Client,
         base_url: reqwest::Url,
         authenticator: Authenticator,

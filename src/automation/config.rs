@@ -9,6 +9,7 @@ use std::str::FromStr;
 
 use super::rules::humidity::HumidityConfig;
 use super::rules::open_window::OpenWindowConfig;
+use super::rules::presence::PresenceConfig;
 use super::rules::season::SeasonConfig;
 
 const DEFAULT_STATE_PATH: &str = "tado-automation.json";
@@ -21,6 +22,7 @@ pub struct AutomationConfig {
     pub open_window: OpenWindowConfig,
     pub season: SeasonConfig,
     pub humidity: HumidityConfig,
+    pub presence: PresenceConfig,
 }
 
 impl AutomationConfig {
@@ -36,11 +38,15 @@ impl AutomationConfig {
             open_window: OpenWindowConfig::from_lookup(&lookup),
             season: SeasonConfig::from_lookup(&lookup),
             humidity: HumidityConfig::from_lookup(&lookup),
+            presence: PresenceConfig::from_lookup(&lookup),
         }
     }
 
     pub fn any_rule_enabled(&self) -> bool {
-        self.open_window.enabled || self.season.enabled || self.humidity.enabled
+        self.open_window.enabled
+            || self.season.enabled
+            || self.humidity.enabled
+            || self.presence.enabled
     }
 
     pub fn print(&self) {
@@ -63,6 +69,10 @@ impl AutomationConfig {
             humidity.boost_celsius,
             humidity.boost_minutes,
             humidity.max_boosts_per_day
+        );
+        println!(
+            "Automation presence: {} (away after {} polls)",
+            self.presence.enabled, self.presence.away_polls
         );
     }
 }

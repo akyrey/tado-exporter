@@ -58,13 +58,6 @@ pub enum ZoneControl {
     BoostEnded { then_off: bool },
 }
 
-impl ZoneControl {
-    /// Whether rules may change this zone's heating.
-    pub fn is_automatable(self) -> bool {
-        !matches!(self, ZoneControl::Manual)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct ZoneSnapshot {
     pub id: i32,
