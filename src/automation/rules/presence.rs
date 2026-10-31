@@ -2,7 +2,8 @@
 //!
 //! AWAY once every located phone has been away for `away_polls` consecutive ticks; HOME as
 //! soon as one is home. The rule acts only when the phone-derived presence *changes*, so a
-//! presence set by hand in the app is kept until the phones disagree with it again.
+//! presence set by hand in the app is kept until the phones disagree with it again. The first
+//! observation (fresh state, or after switching dry-run/live) is adopted without acting.
 
 use serde_derive::{Deserialize, Serialize};
 
@@ -48,10 +49,17 @@ pub fn evaluate(
     snapshot: &Snapshot,
     state: &PresenceState,
 ) -> (Vec<Action>, PresenceState) {
-    // Phones not fetched or none sharing a location: nothing to base a decision on.
+    // Phones not fetched or none sharing a location: nothing to base a decision on, and the
+    // away streak must restart, as the polls around the gap are not consecutive.
     let observed = match snapshot.phones.as_deref().and_then(observed_presence) {
         Some(observed) => observed,
-        None => return (Vec::new(), state.clone()),
+        None => {
+            let next = PresenceState {
+                away_streak: 0,
+                ..state.clone()
+            };
+            return (Vec::new(), next);
+        }
     };
 
     let away_streak = match observed {
@@ -64,7 +72,7 @@ pub fn evaluate(
         Presence::Away => state.confirmed,
     };
 
-    let changed = confirmed != state.confirmed;
+    let changed = state.confirmed.is_some() && confirmed != state.confirmed;
     let actions = match confirmed {
         Some(presence) if changed && snapshot.presence != Some(presence) => {
             vec![Action::SetPresence(presence)]
@@ -187,11 +195,15 @@ mod tests {
     }
 
     #[test]
-    fn keeps_state_without_located_phones() {
+    fn keeps_confirmed_presence_but_restarts_streak_without_located_phones() {
         // Arrange
         let state = PresenceState {
             confirmed: Some(Presence::Home),
             away_streak: 1,
+        };
+        let expected = PresenceState {
+            confirmed: Some(Presence::Home),
+            away_streak: 0,
         };
 
         // Act
@@ -201,7 +213,20 @@ mod tests {
 
         // Assert
         assert!(not_fetched.is_empty() && none_located.is_empty());
-        assert_eq!(kept, state);
-        assert_eq!(kept_again, state);
+        assert_eq!(kept, expected);
+        assert_eq!(kept_again, expected);
+    }
+
+    #[test]
+    fn adopts_first_observation_without_overriding_manual_presence() {
+        // Arrange: fresh state, phones home, but someone set AWAY by hand.
+        let phones_home = snapshot(Presence::Away, Some(vec![true]));
+
+        // Act
+        let (actions, state) = evaluate(&config(), &phones_home, &PresenceState::default());
+
+        // Assert
+        assert!(actions.is_empty());
+        assert_eq!(state.confirmed, Some(Presence::Home));
     }
 }

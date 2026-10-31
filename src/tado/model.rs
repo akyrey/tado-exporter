@@ -158,4 +158,7 @@ pub struct MobileDeviceSettingsApiResponse {
 #[allow(non_snake_case)]
 pub struct MobileDeviceLocationApiResponse {
     pub atHome: bool,
+    /// The location is outdated (e.g. the phone stopped reporting).
+    #[serde(default)]
+    pub stale: Option<bool>,
 }

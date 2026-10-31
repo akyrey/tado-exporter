@@ -17,6 +17,8 @@ pub const NAME: &str = "season";
 const SECONDS_PER_HOUR: u64 = 3600;
 /// The window counts as covered once samples span this share of it (tolerates tick jitter).
 const COVERAGE_PERCENT: u64 = 95;
+/// Upper bound for the window, keeping the time arithmetic far from overflow.
+const MAX_WINDOW_HOURS: u64 = 7 * 24;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SeasonConfig {
@@ -44,8 +46,9 @@ impl SeasonConfig {
             config.on_below
         );
         assert!(
-            config.window_hours > 0,
-            "AUTOMATION_SEASON_WINDOW_HOURS must be positive"
+            (1..=MAX_WINDOW_HOURS).contains(&config.window_hours),
+            "AUTOMATION_SEASON_WINDOW_HOURS must be between 1 and {}",
+            MAX_WINDOW_HOURS
         );
 
         config

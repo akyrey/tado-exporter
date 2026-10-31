@@ -10,10 +10,12 @@ use super::state::{self, AutomationState, OverlayInfo, StateStore};
 use super::{Action, Decision, PhoneLocation, Presence, Snapshot, Timestamp, ZoneSnapshot};
 use crate::tado::model::{MobileDeviceApiResponse, WeatherApiResponse, ZoneStateResponse};
 
-/// The outcome of one evaluation: what to do, and the rule state to keep afterwards.
+/// The outcome of one evaluation: what to do, what was dropped because a higher-priority rule
+/// already acts on the same target, and the rule state to keep if every decision is applied.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Evaluation {
     pub decisions: Vec<Decision>,
+    pub dropped: Vec<Decision>,
     pub state: AutomationState,
 }
 
@@ -27,7 +29,14 @@ impl Engine {
     pub fn new(config: AutomationConfig) -> Engine {
         let store = StateStore::new(&config.state_path);
         let state = if config.any_rule_enabled() {
-            store.load()
+            let loaded = store.load();
+            if loaded
+                .dry_run
+                .is_some_and(|dry_run| dry_run != config.dry_run)
+            {
+                info!("automation mode changed since last run: season, presence and open-window memory reset");
+            }
+            loaded.for_mode(config.dry_run)
         } else {
             AutomationState::default()
         };
@@ -45,6 +54,11 @@ impl Engine {
 
     pub fn is_enabled(&self) -> bool {
         self.config.any_rule_enabled()
+    }
+
+    /// The state as of the end of the previous tick.
+    pub fn state(&self) -> &AutomationState {
+        &self.state
     }
 
     pub fn is_dry_run(&self) -> bool {
@@ -83,12 +97,12 @@ impl Engine {
 }
 
 /// Runs every enabled rule. Rules earlier in the list win when two touch the same zone.
+/// Ownership is reconciled by the executor once it knows which decisions were applied.
 pub fn evaluate(
     config: &AutomationConfig,
     state: &AutomationState,
     snapshot: &Snapshot,
 ) -> Evaluation {
-    let state = state::reconcile(state, snapshot);
     let mut proposed: Vec<Decision> = Vec::new();
 
     let open_window = run_rule(
@@ -102,7 +116,9 @@ pub fn evaluate(
         config.humidity.enabled,
         humidity::NAME,
         &state.humidity,
-        |s| humidity::evaluate(&config.humidity, snapshot, s),
+        // With the season rule on, it decides what happens after a boost (off season: off
+        // again; heating season: back to the schedule), so humidity does not restore "off".
+        |s| humidity::evaluate(&config.humidity, snapshot, s, !config.season.enabled),
         &mut proposed,
     );
     let season = run_rule(
@@ -121,14 +137,17 @@ pub fn evaluate(
         &mut proposed,
     );
 
+    let (decisions, dropped) = without_conflicts(proposed);
+
     Evaluation {
-        decisions: without_conflicts(proposed),
+        decisions,
+        dropped,
         state: AutomationState {
             open_window,
             humidity,
             season,
             presence,
-            ..state
+            ..state.clone()
         },
     }
 }
@@ -150,18 +169,18 @@ fn run_rule<S: Clone>(
     next_state
 }
 
-/// Keeps only the first action per zone (and the first presence change).
-fn without_conflicts(decisions: Vec<Decision>) -> Vec<Decision> {
+/// Splits decisions into the first action per zone (and the first presence change) and the
+/// ones dropped because an earlier rule already acts on the same target.
+fn without_conflicts(decisions: Vec<Decision>) -> (Vec<Decision>, Vec<Decision>) {
     let mut touched_zones = HashSet::new();
     let mut presence_set = false;
 
     decisions
         .into_iter()
-        .filter(|decision| match decision.action.zone() {
+        .partition(|decision| match decision.action.zone() {
             Some(zone) => touched_zones.insert(zone),
             None => !std::mem::replace(&mut presence_set, true),
         })
-        .collect()
 }
 
 pub fn build_snapshot(
@@ -180,7 +199,7 @@ pub fn build_snapshot(
         now,
         zones: zones
             .iter()
-            .map(|zone| zone_snapshot(state, zone))
+            .map(|zone| zone_snapshot(state, zone, now))
             .collect(),
         outside_celsius: weather.map(|w| w.outsideTemperature.celsius),
         presence,
@@ -189,6 +208,8 @@ pub fn build_snapshot(
                 .iter()
                 .filter(|device| device.settings.geoTrackingEnabled)
                 .filter_map(|device| device.location.as_ref())
+                // A stale location says nothing about where the phone is now.
+                .filter(|location| location.stale != Some(true))
                 .map(|location| PhoneLocation {
                     at_home: location.atHome,
                 })
@@ -197,7 +218,11 @@ pub fn build_snapshot(
     }
 }
 
-fn zone_snapshot(state: &AutomationState, zone: &ZoneStateResponse) -> ZoneSnapshot {
+fn zone_snapshot(
+    state: &AutomationState,
+    zone: &ZoneStateResponse,
+    now: Timestamp,
+) -> ZoneSnapshot {
     let response = &zone.state_response;
     let overlay = response.overlay.as_ref().map(|overlay| OverlayInfo {
         power_off: overlay.setting.power.as_deref() == Some("OFF"),
@@ -212,6 +237,7 @@ fn zone_snapshot(state: &AutomationState, zone: &ZoneStateResponse) -> ZoneSnaps
         control: state::zone_control(
             state.owned_overlays.get(&zone.id).copied(),
             overlay.as_ref(),
+            now,
         ),
         setting_celsius: response
             .setting
@@ -295,7 +321,8 @@ mod tests {
             },
         };
         let phones: Vec<MobileDeviceApiResponse> = serde_json::from_value(json!([
-            { "settings": { "geoTrackingEnabled": true }, "location": { "atHome": false } },
+            { "settings": { "geoTrackingEnabled": true }, "location": { "atHome": false, "stale": false } },
+            { "settings": { "geoTrackingEnabled": true }, "location": { "atHome": true, "stale": true } },
             { "settings": { "geoTrackingEnabled": true } },
             { "settings": { "geoTrackingEnabled": false }, "location": { "atHome": true } }
         ]))
@@ -357,12 +384,16 @@ mod tests {
         ];
 
         // Act
-        let kept: Vec<(&str, Option<i32>)> = without_conflicts(decisions)
-            .iter()
-            .map(|d| (d.rule, d.action.zone()))
-            .collect();
+        let (kept, dropped) = without_conflicts(decisions);
+        let summary = |list: &[Decision]| -> Vec<(&str, Option<i32>)> {
+            list.iter().map(|d| (d.rule, d.action.zone())).collect()
+        };
 
         // Assert
-        assert_eq!(kept, vec![("a", Some(1)), ("b", Some(2)), ("c", None)]);
+        assert_eq!(
+            summary(&kept),
+            vec![("a", Some(1)), ("b", Some(2)), ("c", None)]
+        );
+        assert_eq!(summary(&dropped), vec![("b", Some(1)), ("d", None)]);
     }
 }
