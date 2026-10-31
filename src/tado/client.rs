@@ -1,101 +1,51 @@
-use std::time::{Duration, Instant};
+use lazy_static::lazy_static;
+use log::{error, info, warn};
+use reqwest::StatusCode;
 use std::vec::Vec;
 
-use lazy_static::lazy_static;
-use log::{error, info};
-use reqwest;
-
-use super::error::AuthError;
+use super::auth::Authenticator;
 use super::model::{
-    AuthStartResponse, AuthTokensErrorResponse, AuthTokensResponse, MeApiResponse,
-    WeatherApiResponse, ZoneStateApiResponse, ZoneStateResponse, ZonesApiResponse,
+    MeApiResponse, WeatherApiResponse, ZoneStateApiResponse, ZoneStateResponse, ZonesApiResponse,
 };
 
-const AUTH_PENDING_MESSAGE: &str = "authorization_pending";
-
 lazy_static! {
-    // TODO: POST DEVICE - https://login.tado.com/oauth2/device
-    static ref AUTH_START_URL: reqwest::Url = "https://login.tado.com/oauth2/device_authorize".parse().unwrap();
-    static ref AUTH_TOKEN_URL: reqwest::Url = "https://login.tado.com/oauth2/token".parse().unwrap();
     pub static ref BASE_URL: reqwest::Url = "https://my.tado.com/api/v2/".parse().unwrap();
 }
 
 pub struct Client {
     http_client: reqwest::Client,
     base_url: reqwest::Url,
-
-    // API Authentication information.
-    username: String,
-    password: String,
-    client_id: String,
-    tokens: AuthTokensResponse,
-    tokens_refresh_by: Instant,
-
+    authenticator: Authenticator,
+    access_token: String,
     home_id: i32,
 }
 
 impl Client {
-    pub fn new(username: String, password: String, client_id: String) -> Client {
-        Client::with_base_url(BASE_URL.clone(), username, password, client_id)
+    pub fn new(http_client: reqwest::Client, authenticator: Authenticator) -> Client {
+        Client::with_base_url(http_client, BASE_URL.clone(), authenticator)
     }
 
     fn with_base_url(
+        http_client: reqwest::Client,
         base_url: reqwest::Url,
-        username: String,
-        password: String,
-        client_id: String,
+        authenticator: Authenticator,
     ) -> Client {
         Client {
-            http_client: reqwest::Client::new(),
+            http_client,
             base_url,
-            username,
-            password,
-            client_id,
-            tokens: AuthTokensResponse {
-                access_token: String::default(),
-                expires_in: 0,
-                refresh_token: String::default(),
-            },
-            tokens_refresh_by: Instant::now(),
+            authenticator,
+            access_token: String::default(),
             home_id: 0,
         }
-    }
-
-    /// Authenticate to the Tado API service.
-    ///
-    /// The authentication processes uses the oauth2 device code grant flow as required by Tado
-    /// <https://support.tado.com/en/articles/8565472-how-do-i-authenticate-to-access-the-rest-api>.
-    ///
-    /// To avoid manual intervention, the method also attempts to complete the login challenge
-    /// on behalf of the user.
-    pub async fn authenticate(&mut self) -> Result<(), AuthError> {
-        // Start device authentication flow.
-        let start_params = [
-            ("client_id", self.client_id.as_str()),
-            ("scope", "offline_access"),
-        ];
-        let resp = self
-            .http_client
-            .post(AUTH_START_URL.clone())
-            .form(&start_params)
-            .send()
-            .await?;
-        let start = resp.json::<AuthStartResponse>().await?;
-        info!("Started device authentication flow with URL {}", start.verification_uri_complete);
-
-        // TODO: run through login flow.
-
-        // Wait for API tokens to be returned once the flow is complete.
-        self.wait_for_tokens(start).await?;
-        Ok(())
     }
 
     async fn get(&self, url: reqwest::Url) -> Result<reqwest::Response, reqwest::Error> {
         self.http_client
             .get(url)
-            .header("Authorization", format!("Bearer {}", self.tokens.access_token))
+            .bearer_auth(&self.access_token)
             .send()
-            .await
+            .await?
+            .error_for_status()
     }
 
     async fn me(&self) -> Result<MeApiResponse, reqwest::Error> {
@@ -132,49 +82,55 @@ impl Client {
         resp.json::<WeatherApiResponse>().await
     }
 
-    /// Refresh the API access token if it expired.
-    pub async fn refresh_authentication(&mut self) -> Result<(), AuthError> {
-        if Instant::now() < self.tokens_refresh_by {
-            return Ok(());
+    /// Ensures a valid access token and a known home identifier. Call it once per tick before
+    /// the `retrieve_*` functions; returns `false` (after logging why) when the API cannot be
+    /// called yet. A missing authorization blocks here while the device flow is pending.
+    pub async fn prepare(&mut self) -> bool {
+        self.access_token = match self.authenticator.access_token().await {
+            Ok(token) => token,
+            Err(e) => {
+                error!("unable to authenticate: {}", e);
+                return false;
+            }
+        };
+
+        if self.home_id != 0 {
+            return true;
         }
 
-        let refresh_params = [
-            ("client_id", self.client_id.as_str()),
-            ("grant_type", "refresh_token"),
-            ("refresh_token", self.tokens.refresh_token.as_str()),
-        ];
-        let resp = self
-            .http_client
-            .post(AUTH_TOKEN_URL.clone())
-            .form(&refresh_params)
-            .send()
-            .await?;
+        match self.me().await {
+            Ok(me) => match me.homes.first() {
+                Some(home) => {
+                    self.home_id = home.id;
+                    true
+                }
+                None => {
+                    error!("the tado° account has no home");
+                    false
+                }
+            },
+            Err(e) => {
+                self.handle_api_error("unable to retrieve home identifier", &e);
+                false
+            }
+        }
+    }
 
-        let tokens = resp.json::<AuthTokensResponse>().await?;
-        self.set_tokens(tokens);
-        info!("API access tokens refreshed");
-        Ok(())
+    fn handle_api_error(&mut self, context: &str, e: &reqwest::Error) {
+        error!("{}: {}", context, e);
+
+        if e.status() == Some(StatusCode::UNAUTHORIZED) {
+            warn!("tado° rejected the access token, it will be renewed on the next tick");
+            self.authenticator.invalidate();
+        }
     }
 
     pub async fn retrieve_zones(&mut self) -> Vec<ZoneStateResponse> {
-        // retrieve home details (only if we don't already have a home identifier)
-        if self.home_id == 0 {
-            let me_response = match self.me().await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    error!("unable to retrieve home identifier: {}", e);
-                    return Vec::new();
-                }
-            };
-
-            self.home_id = me_response.homes.first().unwrap().id;
-        }
-
         // retrieve home different zones
         let zones_response = match self.zones().await {
             Ok(resp) => resp,
             Err(e) => {
-                error!("unable to retrieve home zones: {}", e);
+                self.handle_api_error("unable to retrieve home zones", &e);
                 return Vec::new();
             }
         };
@@ -186,7 +142,8 @@ impl Client {
             let zone_state_response = match self.zone_state(zone.id).await {
                 Ok(resp) => resp,
                 Err(e) => {
-                    error!("unable to retrieve home zone '{}' state: {}", zone.name, e);
+                    let context = format!("unable to retrieve home zone '{}' state", zone.name);
+                    self.handle_api_error(&context, &e);
                     return Vec::new();
                 }
             };
@@ -203,85 +160,17 @@ impl Client {
     pub async fn retrieve_weather(&mut self) -> Option<WeatherApiResponse> {
         info!("retrieving weather details ...");
 
-        // retrieve home details (only if we don't already have a home identifier)
-        if self.home_id == 0 {
-            let me_response = match self.me().await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    error!("unable to retrieve home identifier: {}", e);
-                    return None;
-                }
-            };
-
-            self.home_id = me_response.homes.first().unwrap().id;
-        }
-
-        // retrieve weather state
-        let weather_response = match self.weather().await {
-            Ok(resp) => resp,
+        match self.weather().await {
+            Ok(resp) => Some(resp),
             Err(e) => {
-                error!("unable to retrieve weather info: {}", e);
-                return None;
+                self.handle_api_error("unable to retrieve weather info", &e);
+                None
             }
-        };
-
-        Some(weather_response)
-    }
-
-    /// Set the API access tokens to use and manage related metadata.
-    fn set_tokens(&mut self, tokens: AuthTokensResponse) {
-        // Reduce the tokens validity slightly to refresh before they expire.
-        let expires_in = tokens.expires_in - 10;
-        self.tokens = tokens;
-        self.tokens_refresh_by = Instant::now() + Duration::from_secs(expires_in);
-    }
-
-    async fn wait_for_tokens(&mut self, start: AuthStartResponse) -> Result<(), AuthError> {
-        let must_complete_by = Instant::now() + Duration::from_secs(start.expires_in);
-        let token_params = [
-            ("client_id", self.client_id.as_str()),
-            ("device_code", &start.device_code),
-            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-        ];
-        while Instant::now() < must_complete_by {
-            let resp = self
-                .http_client
-                .post(AUTH_TOKEN_URL.clone())
-                .form(&token_params)
-                .send()
-                .await?;
-            match resp.status() {
-                reqwest::StatusCode::OK => {
-                    let tokens = resp.json::<AuthTokensResponse>().await?;
-                    self.set_tokens(tokens);
-                    info!("Device authentication flow completed");
-                    return Ok(());
-                }
-                reqwest::StatusCode::BAD_REQUEST => {
-                    let error = resp
-                        .error_for_status_ref()
-                        .expect_err("must be error for BAD_REQUEST");
-                    let failure = resp.json::<AuthTokensErrorResponse>().await?;
-                    if failure.error != AUTH_PENDING_MESSAGE {
-                        return Err(AuthError::from(error));
-                    }
-                }
-                _ => {
-                    let status = resp.status();
-                    let url = resp.url().clone();
-                    resp.error_for_status()?;
-                    return Err(AuthError::UnexpectedStatus(status, url));
-                }
-            }
-            info!("Device authentication flow still pending, will retry");
-            tokio::time::sleep(Duration::from_secs(start.interval)).await;
         }
-        Err(AuthError::Timeout)
     }
 }
 
 #[cfg(test)]
-
 mod tests {
     use super::*;
 
@@ -293,37 +182,144 @@ mod tests {
         ZoneStateSettingApiResponse, ZoneStateSettingTemperatureApiResponse,
     };
 
+    use crate::tado::token_store::TokenStore;
     use rstest::*;
-    use wiremock::matchers::{method, path};
+    use serde_json::json;
+    use tempfile::TempDir;
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn test_client(base_url: reqwest::Url) -> (Client, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let store = TokenStore::new(dir.path().join("token.json"));
+        let http_client = reqwest::Client::new();
+        let authenticator = Authenticator::new(http_client.clone(), store);
+        (
+            Client::with_base_url(http_client, base_url, authenticator),
+            dir,
+        )
+    }
 
     #[test]
     fn test_new() {
+        let dir = TempDir::new().unwrap();
+        let store = TokenStore::new(dir.path().join("token.json"));
         let client = Client::new(
-            "username".to_string(),
-            "password".to_string(),
-            "client_id".to_string(),
+            reqwest::Client::new(),
+            Authenticator::new(reqwest::Client::new(), store),
         );
 
-        assert_eq!(client.username, "username");
-        assert_eq!(client.password, "password");
-        assert_eq!(client.client_id, "client_id");
         assert_eq!(client.base_url, *BASE_URL);
+        assert_eq!(client.home_id, 0);
     }
 
     #[test]
     fn test_with_base_url() {
-        let client = Client::with_base_url(
-            "https://example.com".parse().unwrap(),
-            "username".to_string(),
-            "password".to_string(),
-            "client_id".to_string(),
-        );
+        let (client, _dir) = test_client("https://example.com".parse().unwrap());
 
-        assert_eq!(client.username, "username");
-        assert_eq!(client.password, "password");
-        assert_eq!(client.client_id, "client_id");
         assert_eq!(client.base_url, "https://example.com".parse().unwrap());
+    }
+
+    async fn authenticated_client(server: &MockServer, dir: &TempDir) -> Client {
+        let store = TokenStore::new(dir.path().join("token.json"));
+        store.save("refresh-1").unwrap();
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .and(query_param("refresh_token", "refresh-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-1",
+                "expires_in": 599,
+                "refresh_token": "refresh-2"
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .and(query_param("refresh_token", "refresh-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-2",
+                "expires_in": 599,
+                "refresh_token": "refresh-3"
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/me"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "homes": [{ "id": 42 }] })),
+            )
+            .expect(1)
+            .mount(server)
+            .await;
+
+        let http_client = reqwest::Client::new();
+        let auth_url = format!("{}/oauth2/", server.uri()).parse().unwrap();
+        let authenticator = Authenticator::with_base_url(http_client.clone(), auth_url, store);
+        Client::with_base_url(http_client, server.uri().parse().unwrap(), authenticator)
+    }
+
+    #[tokio::test]
+    async fn retrieve_weather_authenticates_and_resolves_home_once() {
+        // Arrange
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        Mock::given(method("GET"))
+            .and(path("/homes/42/weather/"))
+            .and(header("Authorization", "Bearer access-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "solarIntensity": { "percentage": 10.0 },
+                "outsideTemperature": { "celsius": 5.0, "fahrenheit": 41.0 }
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut client = authenticated_client(&server, &dir).await;
+
+        // Act
+        assert!(client.prepare().await);
+        let first = client.retrieve_weather().await;
+        assert!(client.prepare().await);
+        let second = client.retrieve_weather().await;
+
+        // Assert
+        assert!(first.is_some());
+        assert!(second.is_some());
+        assert_eq!(client.home_id, 42);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_response_forces_token_renewal() {
+        // Arrange
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        Mock::given(method("GET"))
+            .and(path("/homes/42/weather/"))
+            .and(header("Authorization", "Bearer access-1"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/homes/42/weather/"))
+            .and(header("Authorization", "Bearer access-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "solarIntensity": { "percentage": 10.0 },
+                "outsideTemperature": { "celsius": 5.0, "fahrenheit": 41.0 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut client = authenticated_client(&server, &dir).await;
+
+        // Act
+        assert!(client.prepare().await);
+        let rejected = client.retrieve_weather().await;
+        assert!(client.prepare().await);
+        let renewed = client.retrieve_weather().await;
+
+        // Assert
+        assert!(rejected.is_none());
+        assert!(renewed.is_some());
     }
 
     #[rstest(response_str, expected,
@@ -377,12 +373,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = Client::with_base_url(
-            mock_server.uri().parse().unwrap(),
-            "username".to_string(),
-            "password".to_string(),
-            "client_secret".to_string(),
-        );
+        let (client, _dir) = test_client(mock_server.uri().parse().unwrap());
 
         // WHEN
         let actual = client.weather().await.unwrap();
@@ -523,12 +514,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let mut client = Client::with_base_url(
-            mock_server.uri().parse().unwrap(),
-            "username".to_string(),
-            "passwored".to_string(),
-            "client_secret".to_string(),
-        );
+        let (mut client, _dir) = test_client(mock_server.uri().parse().unwrap());
 
         // WHEN
         let actual = client.zone_state(0).await.unwrap();
